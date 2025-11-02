@@ -1,0 +1,1 @@
+obj-y += land_on_target.o

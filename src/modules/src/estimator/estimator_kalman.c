@@ -127,6 +127,8 @@ const uint32_t PREDICTION_UPDATE_INTERVAL_MS = 1000 / PREDICT_RATE;
 static bool robustTwr = false;
 static bool robustTdoa = false;
 
+float innovationTOF = 0.0f;
+
 /**
  * Quadrocopter State
  *
@@ -331,13 +333,21 @@ static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlyi
         }
         break;
       case MeasurementTypeTOF:
-        kalmanCoreUpdateWithTof(&coreData, &m.data.tof);
+        if (quadIsFlying) {
+          kalmanCoreUpdateWithTof(&coreData, &m.data.tof, &innovationTOF);
+        }
         break;
       case MeasurementTypeAbsoluteHeight:
         kalmanCoreUpdateWithAbsoluteHeight(&coreData, &m.data.height);
         break;
       case MeasurementTypeFlow:
+      if (quadIsFlying && (innovationTOF) < 0.1f) { // only use flow when TOF innovation is small
         kalmanCoreUpdateWithFlow(&coreData, &m.data.flow, &gyroLatest);
+        }
+      else if (quadIsFlying && (innovationTOF) >= 0.1f) {
+          DEBUG_PRINT("Flow update skipped, TOF innovation too large: %.3f m\n", (double)innovationTOF);
+        }
+        
         break;
       case MeasurementTypeYawError:
         kalmanCoreUpdateWithYawError(&coreData, &m.data.yawError);

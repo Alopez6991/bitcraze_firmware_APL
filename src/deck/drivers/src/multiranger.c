@@ -70,6 +70,20 @@ static bool mrInitSensor(VL53L1_Dev_t *pdev, uint32_t pca95pin, char *name)
     if (vl53l1xInit(pdev, I2C1_DEV))
     {
         DEBUG_PRINT("Init %s sensor [OK]\n", name);
+
+        // (void)VL53L1_SetDistanceMode(pdev, VL53L1_DISTANCEMODE_MEDIUM);
+        // (void)VL53L1_SetMeasurementTimingBudgetMicroSeconds(pdev, 33000);   // 33 ms
+        // (void)VL53L1_SetInterMeasurementPeriodMilliSeconds(pdev, 35);  
+        
+        /* Long-range configuration */
+        (void)VL53L1_SetDistanceMode(pdev, VL53L1_DISTANCEMODE_LONG);
+
+        /* Budget in microseconds (e.g., 80000 for 80 ms) */
+        (void)VL53L1_SetMeasurementTimingBudgetMicroSeconds(pdev, 80000);
+
+        /* Inter-measurement in milliseconds (must be >= budget) */
+        (void)VL53L1_SetInterMeasurementPeriodMilliSeconds(pdev, 85);
+
         status = true;
     }
     else

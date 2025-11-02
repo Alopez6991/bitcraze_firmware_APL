@@ -65,6 +65,8 @@
 
 #include "math3d.h"
 #include "static_mem.h"
+#include "debug.h"
+
 
 // #define DEBUG_STATE_CHECK
 
@@ -251,6 +253,7 @@ void kalmanCoreScalarUpdate(kalmanCoreData_t* this, arm_matrix_instance_f32 *Hm,
   // Calculate the Kalman gain and perform the state update
   for (int i=0; i<KC_STATE_DIM; i++) {
     K[i] = PHTd[i]/HPHR; // kalman gain = (PH' (HPH' + R )^-1)
+    // DEBUG_PRINT("innovation: %.6f, K[%d]: %.6f\n", (double)error, i, (double)K[i]);
     this->S[i] = this->S[i] + K[i] * error; // state update
   }
   assertStateNotNaN(this);
@@ -513,14 +516,19 @@ static void predictDt(kalmanCoreData_t* this, const kalmanCoreParams_t *params, 
   else // Acceleration can be in any direction, as measured by the accelerometer. This occurs, eg. in freefall or while being carried.
   {
     // position updates in the body frame (will be rotated to inertial frame)
-    dx = this->S[KC_STATE_PX] * dt + acc->x * dt2 / 2.0f;
-    dy = this->S[KC_STATE_PY] * dt + acc->y * dt2 / 2.0f;
-    dz = this->S[KC_STATE_PZ] * dt + acc->z * dt2 / 2.0f; // thrust can only be produced in the body's Z direction
+    // dx = this->S[KC_STATE_PX] * dt + acc->x * dt2 / 2.0f;
+    // dy = this->S[KC_STATE_PY] * dt + acc->y * dt2 / 2.0f;
+    // dz = this->S[KC_STATE_PZ] * dt + acc->z * dt2 / 2.0f; // thrust can only be produced in the body's Z direction
+
+    dx = 0.0;
+    dy = 0.0;
+    dz = 0.0;
 
     // position update
     this->S[KC_STATE_X] += this->R[0][0] * dx + this->R[0][1] * dy + this->R[0][2] * dz;
     this->S[KC_STATE_Y] += this->R[1][0] * dx + this->R[1][1] * dy + this->R[1][2] * dz;
-    this->S[KC_STATE_Z] += this->R[2][0] * dx + this->R[2][1] * dy + this->R[2][2] * dz - GRAVITY_MAGNITUDE * dt2 / 2.0f;
+    // this->S[KC_STATE_Z] += this->R[2][0] * dx + this->R[2][1] * dy + this->R[2][2] * dz - GRAVITY_MAGNITUDE * dt2 / 2.0f;
+    this->S[KC_STATE_Z] += this->R[2][0] * dx + this->R[2][1] * dy + this->R[2][2] * dz;
 
     // keep previous time step's state for the update
     tmpSPX = this->S[KC_STATE_PX];
@@ -528,9 +536,13 @@ static void predictDt(kalmanCoreData_t* this, const kalmanCoreParams_t *params, 
     tmpSPZ = this->S[KC_STATE_PZ];
 
     // body-velocity update: accelerometers - gyros cross velocity - gravity in body frame
-    this->S[KC_STATE_PX] += dt * (acc->x + gyro->z * tmpSPY - gyro->y * tmpSPZ - GRAVITY_MAGNITUDE * this->R[2][0]);
-    this->S[KC_STATE_PY] += dt * (acc->y - gyro->z * tmpSPX + gyro->x * tmpSPZ - GRAVITY_MAGNITUDE * this->R[2][1]);
-    this->S[KC_STATE_PZ] += dt * (acc->z + gyro->y * tmpSPX - gyro->x * tmpSPY - GRAVITY_MAGNITUDE * this->R[2][2]);
+    // this->S[KC_STATE_PX] += dt * (acc->x + gyro->z * tmpSPY - gyro->y * tmpSPZ - GRAVITY_MAGNITUDE * this->R[2][0]);
+    // this->S[KC_STATE_PY] += dt * (acc->y - gyro->z * tmpSPX + gyro->x * tmpSPZ - GRAVITY_MAGNITUDE * this->R[2][1]);
+    // this->S[KC_STATE_PZ] += dt * (acc->z + gyro->y * tmpSPX - gyro->x * tmpSPY - GRAVITY_MAGNITUDE * this->R[2][2]);
+
+    this->S[KC_STATE_PX] = 0.0;
+    this->S[KC_STATE_PY] = 0.0;
+    this->S[KC_STATE_PZ] = 0.0;
   }
 
   // attitude update (rotate by gyroscope), we do this in quaternions
