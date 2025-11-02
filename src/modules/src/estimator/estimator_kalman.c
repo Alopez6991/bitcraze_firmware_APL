@@ -334,20 +334,16 @@ static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlyi
         break;
       case MeasurementTypeTOF:
         if (quadIsFlying) {
-          kalmanCoreUpdateWithTof(&coreData, &m.data.tof, &innovationTOF);
+          kalmanCoreUpdateWithTof(&coreData, &m.data.tof);
         }
         break;
       case MeasurementTypeAbsoluteHeight:
         kalmanCoreUpdateWithAbsoluteHeight(&coreData, &m.data.height);
         break;
       case MeasurementTypeFlow:
-      if (quadIsFlying && (innovationTOF) < 0.1f) { // only use flow when TOF innovation is small
-        kalmanCoreUpdateWithFlow(&coreData, &m.data.flow, &gyroLatest);
-        }
-      else if (quadIsFlying && (innovationTOF) >= 0.1f) {
-          DEBUG_PRINT("Flow update skipped, TOF innovation too large: %.3f m\n", (double)innovationTOF);
-        }
-        
+        if (quadIsFlying) { 
+          kalmanCoreUpdateWithFlow(&coreData, &m.data.flow, &gyroLatest);
+        }        
         break;
       case MeasurementTypeYawError:
         kalmanCoreUpdateWithYawError(&coreData, &m.data.yawError);

@@ -33,14 +33,14 @@
 #define AUX_ACTIVE_THRESH         1400        // cppm.aux3 < 1400 => active
 #define TARGET_HEIGHT_M           1.00f
 #define HOVER_TIME_MS             2000U
-#define LAND_HOLD_MS              2500U
+#define LAND_HOLD_MS              1500U
 #define ARM_TIMEOUT_MS            2000U
 
 // Velocity loop
 #define LOOP_HZ                   50U         // 50–100 Hz is fine
 #define FEED_PERIOD_MS            (1000U/LOOP_HZ)
 #define BASE_FWD_VEL              0.50f       // m/s world +X
-#define TARGET_DISTANCE_M         6.50f       // nominal stop distance from start
+#define TARGET_DISTANCE_M         3.50f       // nominal stop distance from start
 #define VEL_SMOOTH_TAU_S          0.12f       // exp smoothing time-constant (s)
 #define MAX_ACCEL_MPS2            2.0f        // commanded accel limit
 
@@ -61,7 +61,7 @@ static inline bool is_close_m(float m) {
 #define MONITOR_PERIOD_MS         20U         // ~50 Hz
 #define STEP_THRESH_MM            20.0f       // spike if step <= -20 mm
 #define RATE_THRESH_MM_PER_S      300.0f      // or |rate| >= 300 mm/s
-#define ENABLE_SPIKE_NEAR_DIST_M  1.00f       // only allow spike-stop when within this remaining distance
+#define ENABLE_SPIKE_NEAR_DIST_M  0.25f       // only allow spike-stop when within this remaining distance
 #define MOVE_FORWARD_AFTER_EDGE_M 0.55f       // creep forward after spike stop
 #define CREEP_VEL_MPS             0.10f       // creep velocity
 

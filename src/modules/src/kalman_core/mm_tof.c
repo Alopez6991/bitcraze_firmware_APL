@@ -24,11 +24,8 @@
  */
 
 #include "mm_tof.h"
-#include "debug.h"
 
-
-
-void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof, float *innovation)
+void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof)
 {
   // Updates the filter with a measured distance in the zb direction using the
   float h[KC_STATE_DIM] = {0};
@@ -42,9 +39,7 @@ void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof, floa
     }
     float predictedDistance = this->S[KC_STATE_Z] / cosf(angle);
     float measuredDistance = tof->distance; // [m]
-    *innovation = measuredDistance - predictedDistance;
 
-    
     /*
     The sensor model (Pg.95-96, https://lup.lub.lu.se/student-papers/search/publication/8905295)
     
@@ -59,16 +54,8 @@ void kalmanCoreUpdateWithTof(kalmanCoreData_t* this, tofMeasurement_t *tof, floa
     */
 
     h[KC_STATE_Z] = 1 / cosf(angle); // This just acts like a gain for the sensor model. Further updates are done in the scalar update function below
-    // DEBUG_PRINT("TOF H : %.3f\n", (double)h[KC_STATE_Z]);
+
     // Scalar update
-    // DEBUG_PRINT("TOF innovation: %.3f m (angle: %.1f deg, R[2][2]: %.3f)\n", (double)innovation, (double)(RAD_TO_DEG * angle), (double)this->R[2][2]);
-    if (fabsf(*innovation) > 0.1f) {
-      // Reject large innovations
-      DEBUG_PRINT("TOF innovation too large (%.3f m), rejecting update\n", (double)*innovation);
-      return;
-    }
-    else {
-      kalmanCoreScalarUpdate(this, &H, measuredDistance-predictedDistance, tof->stdDev);
-    }
+    kalmanCoreScalarUpdate(this, &H, measuredDistance-predictedDistance, tof->stdDev);
   }
 }
