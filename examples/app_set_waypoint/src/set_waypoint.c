@@ -31,13 +31,13 @@
 /* ---------- User-configurable mission params ---------- */
 /* heights (meters) */
 #define Z1_M    0.50f
-#define Z2_M    1.50f
+#define Z2_M    1.20f
 #define TARGET_HEIGHT_M  Z1_M  // Takeoff target (match interrupt_velocity.c pattern)
 
 /* waypoints (world frame, meters) */
-#define P1_X_M  2.20f
+#define P1_X_M  2.00f
 #define P1_Y_M  0.00f
-#define P2_X_M  2.20f
+#define P2_X_M  2.00f
 #define P2_Y_M  -2.20f
 #define P3_X_M  5.00f
 #define P3_Y_M  -2.20f
@@ -273,7 +273,7 @@ static void runSequence(void)
   holdZ_ms(Z1_M, HOVER_BETWEEN_MS);
 
   // Change altitude at p2 to Z2
-  changeAltitudeTo(Z2_M, 0.25f); // climb/descent rate ~0.25 m/s
+  changeAltitudeTo(Z2_M, 0.5f); // climb/descent rate ~0.5 m/s
   holdZ_ms(Z2_M, HOVER_BETWEEN_MS);
 
   // Move to p3 at v2
