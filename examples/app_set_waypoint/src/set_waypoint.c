@@ -35,12 +35,12 @@
 #define TARGET_HEIGHT_M  Z1_M  // Takeoff target (match interrupt_velocity.c pattern)
 
 /* waypoints (world frame, meters) */
-#define P1_X_M  2.00f
+#define P1_X_M  1.85f
 #define P1_Y_M  0.00f
-#define P2_X_M  2.00f
-#define P2_Y_M  -2.20f
+#define P2_X_M  1.85f
+#define P2_Y_M  -2.50f
 #define P3_X_M  5.00f
-#define P3_Y_M  -2.20f
+#define P3_Y_M  -2.50f
 
 /* speeds (m/s) */
 #define V1_MPS  0.5f
