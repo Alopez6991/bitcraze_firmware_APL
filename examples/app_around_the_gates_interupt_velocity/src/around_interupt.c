@@ -73,7 +73,7 @@
 
 // Post-final-right (here final -X) creep and wait
 #define CREEP_VEL_MPS             0.15f       // magnitude along -X
-#define CREEP_TIME_MS             600U        // brief creep duration
+#define CREEP_TIME_MS             1000U        // brief creep duration
 #define WAIT_AFTER_FINAL_MS       10000U      // wait 10 seconds before landing
 
 // Fallback for older trees (invalid is usually 0xFFFF)
