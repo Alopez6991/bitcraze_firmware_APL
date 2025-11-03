@@ -58,9 +58,9 @@
 
 // Segment distances
 #define SEG2_POS_Y_M              0.75f        // +Y
-#define SEG3_POS_X_M              5.6f        // +X
+#define SEG3_POS_X_M              5.2f        // +X
 #define SEG4_NEG_Y_M              7.1f        // -Y
-#define SEG5_NEG_X_M              5.6f        // -X (final leg)
+#define SEG5_NEG_X_M              5.25f        // -X (final leg)
 
 // Multiranger avoidance
 #define AVOID_MIN_DIST_M          0.20f       // start pushing if closer than this
