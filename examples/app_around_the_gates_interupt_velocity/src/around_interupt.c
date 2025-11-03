@@ -69,7 +69,7 @@
 // Down-range spike guard (units mm) with near-target gating at 0.2 m
 #define STEP_THRESH_MM            90.0f      // step change threshold (mm)
 #define RATE_THRESH_MM_PER_S      300.0f      // rate threshold (mm/s)
-#define ENABLE_SPIKE_NEAR_DIST_M  0.20f       // only arm spike stop when this close to segment target
+#define ENABLE_SPIKE_NEAR_DIST_M  0.10f       // only arm spike stop when this close to segment target
 
 // Post-final-right (here final -X) creep and wait
 #define CREEP_VEL_MPS             0.15f       // magnitude along -X
