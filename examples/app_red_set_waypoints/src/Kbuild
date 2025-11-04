@@ -1,0 +1,1 @@
+obj-y += red_set_waypoints.o
