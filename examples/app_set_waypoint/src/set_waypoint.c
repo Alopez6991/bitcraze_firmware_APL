@@ -44,7 +44,7 @@
 
 /* speeds (m/s) */
 #define V1_MPS  0.5f
-#define V2_MPS  1.0f
+#define V2_MPS  2.0f
 #define TAKEOFF_VEL_MPS  0.30f
 
 /* timing */
@@ -216,27 +216,53 @@ static void moveToXYAtSpeed(float tx, float ty, float speed)
   }
 }
 
-/* change altitude to targetZ (meters). */
+/* change altitude to targetZ using vertical velocity mode (faster, tracks climbRate) */
 static void changeAltitudeTo(float targetZ, float climbRate)
 {
+  if (climbRate < 0.10f) climbRate = 0.10f;   // safety floor
+  if (climbRate > 1.50f) climbRate = 1.50f;   // keep reasonable
+
   if (!logVarIdIsValid(idZ)) idZ = logGetVarId("stateEstimate", "z");
-  setpoint_t sp;
   const TickType_t step = pdMS_TO_TICKS(FEED_PERIOD_MS);
+  setpoint_t sp;
 
   for (;;) {
     float z = logGetFloat(idZ);
     if (!isfinite(z)) { vTaskDelay(step); continue; }
+
     const float dz = targetZ - z;
     if (fabsf(dz) <= ARRIVE_Z_M) break;
 
-    float stepZ = climbRate * (FEED_PERIOD_MS / 1000.0f);
-    if (fabsf(stepZ) < 0.01f) stepZ = 0.01f;
-    float zCmd = (dz > 0.0f) ? fminf(z + stepZ, targetZ) : fmaxf(z - stepZ, targetZ);
+    const float vz = copysignf(climbRate, dz);
 
-    setHoverSetpoint(&sp, 0.0f, 0.0f, zCmd, 0.0f, true);
+    memset(&sp, 0, sizeof(sp));
+    sp.mode.x = modeVelocity;  sp.mode.y = modeVelocity;
+    sp.velocity.x = 0.0f;      sp.velocity.y = 0.0f;
+
+    sp.mode.z = modeVelocity;
+    sp.velocity.z = vz;
+
+    sp.mode.yaw = modeVelocity;
+    sp.attitudeRate.yaw = 0.0f;
+
+    sp.velocity_body = false; // world frame
     commanderSetSetpoint(&sp, 3);
     vTaskDelay(step);
   }
+
+  // Brake vertical velocity and settle at target
+  memset(&sp, 0, sizeof(sp));
+  sp.mode.x = modeVelocity;  sp.mode.y = modeVelocity;
+  sp.velocity.x = 0.0f;      sp.velocity.y = 0.0f;
+
+  sp.mode.z = modeVelocity;
+  sp.velocity.z = 0.0f;
+
+  sp.mode.yaw = modeVelocity;
+  sp.attitudeRate.yaw = 0.0f;
+
+  sp.velocity_body = false;
+  commanderSetSetpoint(&sp, 3);
 
   holdZ_ms(targetZ, 200);
 }
@@ -272,8 +298,9 @@ static void runSequence(void)
   moveToXYAtSpeed(P2_X_M, P2_Y_M, V1_MPS);
   holdZ_ms(Z1_M, HOVER_BETWEEN_MS);
 
-  // Change altitude at p2 to Z2
-  changeAltitudeTo(Z2_M, 0.5f); // climb/descent rate ~0.5 m/s
+  // Change altitude at p2 to Z2 (faster climb)
+  // 0.5 m/s climb rate
+  changeAltitudeTo(Z2_M, 0.5f);
   holdZ_ms(Z2_M, HOVER_BETWEEN_MS);
 
   // Move to p3 at v2
