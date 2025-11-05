@@ -4,8 +4,10 @@
  * STEP 1: TAKEOFF -> settle
  * STEP 2: Fly +Y 1.0 m
  * STEP 3: Fly +X 2.6 m
- * STEP 4: Fly -Y 7.1 m
- * STEP 5: Fly -X 2.6 m (only leg that can early-stop on spike within 0.2 m of target)
+ * STEP 4: Fly -Y 6.1 m
+ * STEP 5: Fly -X 1.6 m
+ * STEP 6: Fly -Y 1.0 m
+ * STEP 7: Fly -X 1.0 m (only leg that can early-stop on spike within 0.2 m of target)
  *         Then creep further in -X and wait 10s before landing
  *
  * - Forces Kalman (stabilizer.estimator=2) and pulses kalman.resetEstimation
@@ -14,7 +16,6 @@
  * - Multiranger push-away on front/back/left/right
  * - Down-range spike detector (mm) with near-target gating (0.2 m)
  * - Trigger: cppm.aux3 < 1400 (edge-triggered; once per press)
- * - KILL: cppm.aux0 < 1400 disarms immediately (no landing commands)
  *
  * World axes convention: +X forward, +Y left, +Z up
  */
@@ -60,27 +61,24 @@
 // Segment distances
 #define SEG2_POS_Y_M              0.75f        // +Y
 #define SEG3_POS_X_M              5.2f        // +X
-#define SEG4_NEG_Y_M              7.1f        // -Y
-#define SEG5_NEG_X_M              5.2f        // -X (final leg)
+#define SEG4_NEG_Y_M              6.1f        // -Y
+#define SEG5_NEG_X_M              4.2f        // -X
+#define SEG6_NEG_Y_M              1.0f        // -Y
+#define SEG7_NEG_X_M              1.0f        // -X (final leg)
 
 // Multiranger avoidance
 #define AVOID_MIN_DIST_M          0.20f       // start pushing if closer than this
 #define AVOID_PUSH_VEL_MPS        0.50f       // per-axis push amount
 
 // Down-range spike guard (units mm) with near-target gating at 0.2 m
-#define STEP_THRESH_MM            90.0f      // step change threshold (mm)
+#define STEP_THRESH_MM            90.0f       // step change threshold (mm)
 #define RATE_THRESH_MM_PER_S      200.0f      // rate threshold (mm/s)
-#define ENABLE_SPIKE_NEAR_DIST_M  0.15f       // only arm spike stop when this close to segment target
+#define ENABLE_SPIKE_NEAR_DIST_M  0.20f       // only arm spike stop when this close to segment target
 
 // Post-final-right (here final -X) creep and wait
 #define CREEP_VEL_MPS             0.15f       // magnitude along -X
-#define CREEP_TIME_MS             1000U        // brief creep duration
+#define CREEP_TIME_MS             1000U       // brief creep duration
 #define WAIT_AFTER_FINAL_MS       10000U      // wait 10 seconds before landing
-
-// KILL switch
-#define KILL_SWITCH_GROUP         "cppm"
-#define KILL_SWITCH_NAME          "aux0"
-#define KILL_ACTIVE_THRESH        1400        // aux0 < 1400 => KILL active
 
 // Fallback for older trees (invalid is usually 0xFFFF)
 #ifndef PARAM_VARID_IS_VALID
@@ -89,7 +87,6 @@
 
 /* ---------------- Log IDs & flags ---------------- */
 static logVarId_t idAux3  = 0xFFFFu;
-static logVarId_t idKill  = 0xFFFFu;
 static logVarId_t idX     = 0xFFFFu;
 static logVarId_t idY     = 0xFFFFu;
 static logVarId_t idFront = 0xFFFFu;
@@ -100,30 +97,6 @@ static logVarId_t idDown  = 0xFFFFu;
 
 static bool isActive = false;
 static bool sequenceDoneUntilReset = false;
-
-/*********** Kill helpers ***********/
-static inline bool readSwitchActive_threshold(logVarId_t id, int thr) {
-  if (!logVarIdIsValid(id)) return false;
-  int16_t v = logGetInt(id);
-  return (v > 0) && (v < thr);
-}
-static void ensureKillId(void) {
-  if (!logVarIdIsValid(idKill)) {
-    idKill = logGetVarId(KILL_SWITCH_GROUP, KILL_SWITCH_NAME);
-  }
-}
-static inline bool checkKillAndDisarm(void) {
-  ensureKillId();
-  if (logVarIdIsValid(idKill) && readSwitchActive_threshold(idKill, KILL_ACTIVE_THRESH)) {
-    DEBUG_PRINT("KILL: disarm NOW\n");
-    supervisorRequestArming(false);   // immediate disarm, no landing commands
-    return true;
-  }
-  return false;
-}
-static inline bool isDisarmed(void) {
-  return !supervisorIsArmed();
-}
 
 /*********** Helpers: setpoint & timing ***********/
 static void setHoverSetpoint(setpoint_t* sp, float vx, float vy, float zAbs, float yawRate, bool worldFrame)
@@ -151,7 +124,6 @@ static void holdZ_ms(float zAbs, uint32_t ms)
   setpoint_t sp;
 
   while (left > 0) {
-    if (checkKillAndDisarm() || isDisarmed()) return;
     setHoverSetpoint(&sp, 0.0f, 0.0f, zAbs, 0.0f, true);
     commanderSetSetpoint(&sp, 3);
     vTaskDelay(step);
@@ -166,7 +138,6 @@ static void feedHover_ms(float vx, float vy, float zAbs, uint32_t ms)
   setpoint_t sp;
 
   while (left > 0) {
-    if (checkKillAndDisarm() || isDisarmed()) return;
     setHoverSetpoint(&sp, vx, vy, zAbs, 0.0f, true);
     commanderSetSetpoint(&sp, 3);
     vTaskDelay(step);
@@ -181,7 +152,6 @@ static void zeroBurst_ms(uint32_t ms, uint32_t hz)
   setpoint_t sp;
 
   while (left > 0) {
-    if (checkKillAndDisarm() || isDisarmed()) return;
     setHoverSetpoint(&sp, 0.0f, 0.0f, TARGET_HEIGHT_M, 0.0f, true);
     commanderSetSetpoint(&sp, 3);
     vTaskDelay(step);
@@ -196,7 +166,6 @@ static bool waitForArmed(uint32_t timeout_ms)
   const TickType_t to = pdMS_TO_TICKS(timeout_ms);
 
   while (!supervisorIsArmed()) {
-    if (checkKillAndDisarm()) return false;
     vTaskDelay(dt);
     if ((xTaskGetTickCount() - t0) > to) return false;
   }
@@ -213,13 +182,11 @@ static void rampedTakeoff(float zTarget, float vz_takeoff) {
   if (vz_takeoff > 0.6f)  vz_takeoff = 0.6f;       // keep gentle
 
   while (z < zTarget) {
-    if (checkKillAndDisarm() || isDisarmed()) return;
-    z += vz_takeoff * dt;
-    if (z > zTarget) z = zTarget;
-
     setHoverSetpoint(&sp, 0.0f, 0.0f, z, 0.0f, true);
     commanderSetSetpoint(&sp, 3);
     vTaskDelay(pdMS_TO_TICKS(FEED_PERIOD_MS));
+    z += vz_takeoff * dt;
+    if (z > zTarget) z = zTarget;
   }
 }
 
@@ -284,7 +251,6 @@ static bool runVelAlongDir(float speed, float targetDist, float dirX, float dirY
   // Wait until x,y are valid
   float x = logGetFloat(idX), y = logGetFloat(idY);
   while (!isfinite(x) || !isfinite(y)) {
-    if (checkKillAndDisarm() || isDisarmed()) return false;
     vTaskDelay(pdMS_TO_TICKS(10));
     x = logGetFloat(idX); y = logGetFloat(idY);
   }
@@ -305,8 +271,6 @@ static bool runVelAlongDir(float speed, float targetDist, float dirX, float dirY
   TickType_t lastDownTick = 0;
 
   for (;;) {
-    if (checkKillAndDisarm() || isDisarmed()) return spiked;
-
     // Signed progress along (ux,uy)
     x = logGetFloat(idX); y = logGetFloat(idY);
     if (isfinite(x) && isfinite(y)) {
@@ -399,7 +363,7 @@ static bool runVelAlongDir(float speed, float targetDist, float dirX, float dirY
 /*********** Full sequence ***********/
 static void runSequence(void)
 {
-  DEBUG_PRINT("Sequence: ARM -> TAKEOFF -> settle -> +Y -> +X -> -Y -> -X (spike-gated) -> creep -X & wait -> LAND -> DISARM\n");
+  DEBUG_PRINT("Sequence: ARM -> TAKEOFF -> settle -> +Y -> +X -> -Y -> -X -> -Y -> -X (spike-gated) -> creep -X & wait -> LAND -> DISARM\n");
 
   // STEP 1: TAKEOFF and settle
   forceKalmanAndReset();
@@ -408,89 +372,66 @@ static void runSequence(void)
   if (!waitForArmed(ARM_TIMEOUT_MS)) {
     DEBUG_PRINT("WARN: did not report ARMED within %u ms, continuing\n", (unsigned)ARM_TIMEOUT_MS);
   }
-  if (checkKillAndDisarm() || isDisarmed()) return;
 
   // Neutral warmup on ground
   holdZ_ms(0.0f, 800U);
-  if (checkKillAndDisarm() || isDisarmed()) return;
 
   // Smooth takeoff to target height
   rampedTakeoff(TARGET_HEIGHT_M, TAKEOFF_VEL_MPS);
-  if (checkKillAndDisarm() || isDisarmed()) return;
 
   // Settle
   holdZ_ms(TARGET_HEIGHT_M, 1500U);
-  if (checkKillAndDisarm() || isDisarmed()) return;
   holdZ_ms(TARGET_HEIGHT_M, HOVER_TIME_MS);
-  if (checkKillAndDisarm() || isDisarmed()) return;
 
   // STEP 2: Fly +Y by 1.0 m
   (void)runVelAlongDir(/*speed*/BASE_VEL_MPS, /*dist*/SEG2_POS_Y_M, /*dirX*/0.0f, /*dirY*/+1.0f, /*stopOnSpike*/false);
-  if (checkKillAndDisarm() || isDisarmed()) return;
   holdZ_ms(TARGET_HEIGHT_M, 300U);
-  if (checkKillAndDisarm() || isDisarmed()) return;
 
   // STEP 3: Fly +X by 2.6 m
   (void)runVelAlongDir(/*speed*/BASE_VEL_MPS, /*dist*/SEG3_POS_X_M, /*dirX*/+1.0f, /*dirY*/0.0f, /*stopOnSpike*/false);
-  if (checkKillAndDisarm() || isDisarmed()) return;
   holdZ_ms(TARGET_HEIGHT_M, 300U);
-  if (checkKillAndDisarm() || isDisarmed()) return;
 
-  // STEP 4: Fly -Y by 7.1 m
+  // STEP 4: Fly -Y by 6.1 m
   (void)runVelAlongDir(/*speed*/BASE_VEL_MPS, /*dist*/SEG4_NEG_Y_M, /*dirX*/0.0f, /*dirY*/-1.0f, /*stopOnSpike*/false);
-  if (checkKillAndDisarm() || isDisarmed()) return;
   holdZ_ms(TARGET_HEIGHT_M, 300U);
-  if (checkKillAndDisarm() || isDisarmed()) return;
 
-  // STEP 5: Fly -X by 2.6 m with spike stop only if within 0.2 m of target
-  (void)runVelAlongDir(/*speed*/BASE_VEL_MPS, /*dist*/SEG5_NEG_X_M, /*dirX*/-1.0f, /*dirY*/0.0f, /*stopOnSpike*/true);
-  if (checkKillAndDisarm() || isDisarmed()) return;
+  // STEP 5: Fly -X by 1.6 m
+  (void)runVelAlongDir(/*speed*/BASE_VEL_MPS, /*dist*/SEG5_NEG_X_M, /*dirX*/-1.0f, /*dirY*/0.0f, /*stopOnSpike*/false);
+  holdZ_ms(TARGET_HEIGHT_M, 300U);
+
+  // STEP 6: Fly -Y by 1.0 m
+  (void)runVelAlongDir(/*speed*/BASE_VEL_MPS, /*dist*/SEG6_NEG_Y_M, /*dirX*/0.0f, /*dirY*/-1.0f, /*stopOnSpike*/false);
+  holdZ_ms(TARGET_HEIGHT_M, 300U);
+
+  // STEP 7: Fly -X by 1.0 m with spike stop only if within 0.2 m of target
+  (void)runVelAlongDir(/*speed*/BASE_VEL_MPS, /*dist*/SEG7_NEG_X_M, /*dirX*/-1.0f, /*dirY*/0.0f, /*stopOnSpike*/true);
   holdZ_ms(TARGET_HEIGHT_M, HOVER_TIME_MS);
-  if (checkKillAndDisarm() || isDisarmed()) return;
 
-  // After STEP 5: creep further in -X and wait 10 seconds
+  // After STEP 7: creep further in -X and wait 10 seconds
   feedHover_ms(/*vx*/-CREEP_VEL_MPS, /*vy*/0.0f, TARGET_HEIGHT_M, CREEP_TIME_MS);
-  if (checkKillAndDisarm() || isDisarmed()) return;
   zeroBurst_ms(/*ms*/300, /*hz*/100);
-  if (checkKillAndDisarm() || isDisarmed()) return;
   holdZ_ms(TARGET_HEIGHT_M, WAIT_AFTER_FINAL_MS);
-  if (checkKillAndDisarm() || isDisarmed()) return;
 
   // LAND & DISARM after 10s wait
   holdZ_ms(0.0f, LAND_HOLD_MS);
-  if (checkKillAndDisarm() || isDisarmed()) return;
   holdZ_ms(0.0f, 200U);
-  if (checkKillAndDisarm() || isDisarmed()) return;
   supervisorRequestArming(false);
 
   DEBUG_PRINT("Sequence complete\n");
 }
 
-/*********** Main: switch edge detection + KILL ***********/
+/*********** Main: switch edge detection ***********/
 void appMain(void)
 {
-  DEBUG_PRINT("Waiting for activation ... (START=cppm.aux3<%d, KILL=cppm.aux0<%d)\n",
-               AUX_ACTIVE_THRESH, KILL_ACTIVE_THRESH);
+  DEBUG_PRINT("Waiting for activation ...\n");
 
   TickType_t lastPrint = 0;
 
   while (1) {
     vTaskDelay(F2T(50));   // 50 Hz poll
 
-    // Resolve IDs if needed
     if (!logVarIdIsValid(idAux3)) {
       idAux3 = logGetVarId("cppm", "aux3");
-    }
-    ensureKillId();
-
-    // KILL first (interrupts everything) -> disarm only
-    if (checkKillAndDisarm()) {
-      isActive = false;
-      sequenceDoneUntilReset = false;
-      continue;
-    }
-
-    if (!logVarIdIsValid(idAux3)) {
       continue;
     }
 
