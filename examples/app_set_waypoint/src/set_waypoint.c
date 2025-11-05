@@ -23,24 +23,25 @@
 #include "debug.h"
 #include "log.h"
 #include "param.h"
+#include "crtp_commander_high_level.h"
 
 #include "commander.h"
 #include "stabilizer_types.h"
 #include "supervisor.h"
 
 /* ---------- User-configurable mission params ---------- */
-/* heights (meters) */
-#define Z1_M    0.50f
-#define Z2_M    1.20f
-#define TARGET_HEIGHT_M  Z1_M  // Takeoff target (match interrupt_velocity.c pattern)
+// /* heights (meters) */
+// #define Z1_M    0.50f
+// #define Z2_M    1.20f
+// #define TARGET_HEIGHT_M  Z1_M  // Takeoff target (match interrupt_velocity.c pattern)
 
-/* waypoints (world frame, meters) */
-#define P1_X_M  1.85f
-#define P1_Y_M  0.00f
-#define P2_X_M  1.85f
-#define P2_Y_M  -2.50f
-#define P3_X_M  5.00f
-#define P3_Y_M  -2.50f
+// /* waypoints (world frame, meters) */
+// #define P1_X_M  1.85f
+// #define P1_Y_M  0.00f
+// #define P2_X_M  1.85f
+// #define P2_Y_M  -2.50f
+// #define P3_X_M  5.00f
+// #define P3_Y_M  -2.50f
 
 //  test values
 // /* waypoints (world frame, meters) */
@@ -53,19 +54,19 @@
 
 //red gate code
 
-// /* ---------- User-configurable mission params ---------- */
-// /* heights (meters) */
-// #define Z1_M    0.50f
-// #define Z2_M    1.60f
-// #define TARGET_HEIGHT_M  Z1_M  // Takeoff target (match interrupt_velocity.c pattern)
+/* ---------- User-configurable mission params ---------- */
+/* heights (meters) */
+#define Z1_M    0.50f
+#define Z2_M    1.60f
+#define TARGET_HEIGHT_M  Z1_M  // Takeoff target (match interrupt_velocity.c pattern)
 
-// /* waypoints (world frame, meters) */
-// #define P1_X_M  1.85f
-// #define P1_Y_M  0.00f
-// #define P2_X_M  1.85f
-// #define P2_Y_M  -3.60f
-// #define P3_X_M  5.00f
-// #define P3_Y_M  -3.60f
+/* waypoints (world frame, meters) */
+#define P1_X_M  1.85f
+#define P1_Y_M  0.00f
+#define P2_X_M  1.85f
+#define P2_Y_M  -3.60f
+#define P3_X_M  5.00f
+#define P3_Y_M  -3.60f
 
 /* speeds (m/s) */
 #define V1_MPS  0.5f
@@ -184,25 +185,25 @@ static bool waitForArmed(uint32_t timeout_ms)
 }
 
 /* Smooth vertical climb (same as interrupt_velocity.c) */
-static void rampedTakeoff(float zTarget, float vz_takeoff)
-{
-  const float dt = 1.0f / (float)LOOP_HZ;
-  float z = 0.0f;
-  setpoint_t sp;
+// static void rampedTakeoff(float zTarget, float vz_takeoff)
+// {
+//   const float dt = 1.0f / (float)LOOP_HZ;
+//   float z = 0.0f;
+//   setpoint_t sp;
 
-  if (vz_takeoff < 0.05f) vz_takeoff = 0.05f;
-  if (vz_takeoff > 0.6f)  vz_takeoff = 0.6f;
+//   if (vz_takeoff < 0.05f) vz_takeoff = 0.05f;
+//   if (vz_takeoff > 0.6f)  vz_takeoff = 0.6f;
 
-  while (z < zTarget) {
-    if (checkKillAndDisarm() || isDisarmed()) return;
-    z += vz_takeoff * dt;
-    if (z > zTarget) z = zTarget;
+//   while (z < zTarget) {
+//     if (checkKillAndDisarm() || isDisarmed()) return;
+//     z += vz_takeoff * dt;
+//     if (z > zTarget) z = zTarget;
 
-    setHoverSetpoint(&sp, 0.0f, 0.0f, z, 0.0f, true);
-    commanderSetSetpoint(&sp, 3);
-    vTaskDelay(pdMS_TO_TICKS(FEED_PERIOD_MS));
-  }
-}
+//     setHoverSetpoint(&sp, 0.0f, 0.0f, z, 0.0f, true);
+//     commanderSetSetpoint(&sp, 3);
+//     vTaskDelay(pdMS_TO_TICKS(FEED_PERIOD_MS));
+//   }
+// }
 
 /* Match interrupt_velocity.c: force Kalman + reset */
 static void forceKalmanAndReset(void)
@@ -346,7 +347,9 @@ static void runSequence(void)
   if (checkKillAndDisarm() || isDisarmed()) return;
 
   // Takeoff to TARGET_HEIGHT_M (which equals Z1_M)
-  rampedTakeoff(TARGET_HEIGHT_M, TAKEOFF_VEL_MPS);
+  // rampedTakeoff(TARGET_HEIGHT_M, TAKEOFF_VEL_MPS);
+  crtpCommanderHighLevelTakeoff(TARGET_HEIGHT_M, 1.0f);
+  vTaskDelay(20);
   if (checkKillAndDisarm() || isDisarmed()) return;
 
   // Settle (same as interrupt app)
