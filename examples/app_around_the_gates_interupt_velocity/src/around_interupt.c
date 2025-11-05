@@ -58,7 +58,7 @@
 #define TAKEOFF_VEL_MPS           0.30f
 
 // Segment distances
-#define SEG2_POS_Y_M              0.75f        // +Y
+#define SEG2_POS_Y_M              0.5f        // +Y
 #define SEG3_POS_X_M              5.2f        // +X
 #define SEG4_NEG_Y_M              6.8f        // -Y
 #define SEG5_NEG_X_M              5.2f        // -X (final leg)
