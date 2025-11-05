@@ -60,7 +60,7 @@
 // Segment distances
 #define SEG2_POS_Y_M              0.75f        // +Y
 #define SEG3_POS_X_M              5.2f        // +X
-#define SEG4_NEG_Y_M              7.1f        // -Y
+#define SEG4_NEG_Y_M              6.8f        // -Y
 #define SEG5_NEG_X_M              5.2f        // -X (final leg)
 
 // Multiranger avoidance
@@ -70,10 +70,10 @@
 // Down-range spike guard (units mm) with near-target gating at 0.2 m
 #define STEP_THRESH_MM            90.0f      // step change threshold (mm)
 #define RATE_THRESH_MM_PER_S      200.0f      // rate threshold (mm/s)
-#define ENABLE_SPIKE_NEAR_DIST_M  0.15f       // only arm spike stop when this close to segment target
+#define ENABLE_SPIKE_NEAR_DIST_M  0.20f       // only arm spike stop when this close to segment target
 
 // Post-final-right (here final -X) creep and wait
-#define CREEP_VEL_MPS             0.15f       // magnitude along -X
+#define CREEP_VEL_MPS             0.26f       // magnitude along -X
 #define CREEP_TIME_MS             1000U        // brief creep duration
 #define WAIT_AFTER_FINAL_MS       10000U      // wait 10 seconds before landing
 
