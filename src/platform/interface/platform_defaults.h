@@ -225,13 +225,16 @@
 
 // EKF defaults
 #ifndef EKF_DRAG_BX
-    #define EKF_DRAG_BX 4.2f
+    // #define EKF_DRAG_BX 4.2f
+    #define EKF_DRAG_BX 0.0f
 #endif
 #ifndef EKF_DRAG_BY
-    #define EKF_DRAG_BY 1.8f
+    // #define EKF_DRAG_BY 1.8f
+    #define EKF_DRAG_BY 0.0f
 #endif
 #ifndef EKF_DRAG_BZ
-    #define EKF_DRAG_BZ 0.9f
+    // #define EKF_DRAG_BZ 0.9f
+    #define EKF_DRAG_BZ 0.0f
 #endif
 #ifndef EKF_DRAG_RX
     #define EKF_DRAG_RX 0.0f
@@ -240,5 +243,6 @@
     #define EKF_DRAG_RY 0.0f
 #endif
 #ifndef EKF_DRAG_RZ
-    #define EKF_DRAG_RZ 0.11f
+    // #define EKF_DRAG_RZ 0.11f
+    #define EKF_DRAG_RZ 0.0f
 #endif
