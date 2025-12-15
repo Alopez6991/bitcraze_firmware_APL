@@ -1,7 +1,6 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include <stdio.h>
 
 #include "app.h"
 #include "FreeRTOS.h"
@@ -11,195 +10,131 @@
 #include "debug.h"
 
 #include "log.h"
-#include "commander.h"
-#include "stabilizer_types.h"
+#include "param.h"
+#include "supervisor.h"
+#include "crtp_commander_high_level.h"
 
-// ---------------- Configuration via compile-time defines ----------------
-// Build one of:
-//   -DDRONE_01               // local RC aux1 triggers takeoff/hover/land
-//   -DDRONE_02               // watches peer UWB aux mask
-//
-// If DRONE_02:
-//   -DPEER_INDEX_TO_WATCH=N  // 0..4, which peer auxMaskN to read
-//   -DTRIGGER_AUX_BIT=B      // 0..3, which aux bit to trigger on (default 1 = aux1)
+// Build-time selection: set DRONE_NUMBER to 1 or 2
+#ifndef DRONE_NUMBER
+#define DRONE_NUMBER 1
+#endif
 
-#ifndef TAKEOFF_THRUST
-#define TAKEOFF_THRUST  41000  // adjust to your platform
+#if (DRONE_NUMBER == 1)
+  #ifndef DRONE_01
+  #define DRONE_01
+  #endif
+#elif (DRONE_NUMBER == 2)
+  #ifndef DRONE_02
+  #define DRONE_02
+  #endif
+#else
+  #ifndef DRONE_01
+  #define DRONE_01
+  #endif
 #endif
-#ifndef HOVER_THRUST
-#define HOVER_THRUST    38000  // approximate hover
+
+#ifndef TARGET_HEIGHT_M
+#define TARGET_HEIGHT_M 0.80f
 #endif
-#ifndef MAX_THRUST
-#define MAX_THRUST      65000
+#ifndef HOVER_TIME_MS
+#define HOVER_TIME_MS 1500U
+#endif
+#ifndef ARM_TIMEOUT_MS
+#define ARM_TIMEOUT_MS 2000U
 #endif
 
 #ifndef PEER_INDEX_TO_WATCH
 #define PEER_INDEX_TO_WATCH 0
 #endif
+#define AUX_ACTIVE_THRESH 1400
+#define AUX2_BIT 2
 
-#ifndef TRIGGER_AUX_BIT
-#define TRIGGER_AUX_BIT 1  // aux1 by default
-#endif
-
-#ifndef LOOP_DT_MS
-#define LOOP_DT_MS 10
-#endif
-
-#ifndef TAKEOFF_RAMP_MS
-#define TAKEOFF_RAMP_MS 1000
-#endif
-
-#ifndef HOVER_MS
-#define HOVER_MS 3000
-#endif
-
-#ifndef LAND_RAMP_MS
-#define LAND_RAMP_MS 1200
-#endif
-
-// ---------------- Helpers to read trigger sources ----------------
-
-static logVarId_t idCppmAux1 = LOG_VAR_ID_INVALID;
-static inline bool readLocalAux1LowActive(void) {
-  if (!logVarIdIsValid(idCppmAux1)) {
-    idCppmAux1 = logGetVarId("cppm", "aux1");
-    if (!logVarIdIsValid(idCppmAux1)) {
-      return false;
-    }
-  }
-  // Consider "active" when < 1400us like switch.c
-  const uint16_t v = logGetUint(idCppmAux1);
-  return (v > 0 && v < 1400);
-}
-
-static logVarId_t idPeerAuxMask = LOG_VAR_ID_INVALID;
-static inline uint8_t readPeerAuxMask(void) {
+// IDs (0xFFFF = invalid in this firmware)
+static logVarId_t idAux1 = (logVarId_t)0xFFFF;
 #ifdef DRONE_02
-  if (!logVarIdIsValid(idPeerAuxMask)) {
-    char name[16];
-    snprintf(name, sizeof(name), "auxMask%d", (int)PEER_INDEX_TO_WATCH);
-    idPeerAuxMask = logGetVarId("ranging", name);
-    if (!logVarIdIsValid(idPeerAuxMask)) {
-      return 0;
-    }
-  }
-  return (uint8_t)logGetUint(idPeerAuxMask);
-#else
-  return 0;
+static logVarId_t idPeerMask = (logVarId_t)0xFFFF;
 #endif
+
+static inline bool auxLowActive(logVarId_t id) {
+  if (!logVarIdIsValid(id)) return false;
+  const int16_t v = logGetInt(id);
+  return (v > 0) && (v < AUX_ACTIVE_THRESH);
 }
 
 static inline bool triggerRequested(void) {
 #ifdef DRONE_01
-  return readLocalAux1LowActive();
+  if (!logVarIdIsValid(idAux1)) {
+    idAux1 = logGetVarId("cppm", "aux0");
+  }
+  return auxLowActive(idAux1);
 #elif defined(DRONE_02)
-  uint8_t mask = readPeerAuxMask();
-  return (mask & (1u << TRIGGER_AUX_BIT)) != 0;
+  if (!logVarIdIsValid(idPeerMask)) {
+    char name[16];
+    snprintf(name, sizeof(name), "auxMask%d", (int)PEER_INDEX_TO_WATCH);
+    idPeerMask = logGetVarId("ranging", name);
+  }
+  if (!logVarIdIsValid(idPeerMask)) return false;
+  const uint16_t m = logGetUint(idPeerMask);
+  return (m & (1u << AUX2_BIT)) != 0;
 #else
   return false;
 #endif
 }
 
-// ---------------- Simple thrust flight routine ----------------
+#ifndef PARAM_VARID_IS_VALID
+#define PARAM_VARID_IS_VALID(id) ((id) != (paramVarId_t)0xFFFF)
+#endif
 
-typedef enum {
-  ST_IDLE = 0,
-  ST_TAKEOFF,
-  ST_HOVER,
-  ST_LAND,
-  ST_DONE
-} flight_state_t;
-
-static void sendThrustSetpoint(uint16_t thrust) {
-  if (thrust > MAX_THRUST) thrust = MAX_THRUST;
-
-  setpoint_t sp;
-  memset(&sp, 0, sizeof(sp));
-  // Stabilized attitude = 0, thrust set
-  sp.attitude.roll = 0.0f;
-  sp.attitude.pitch = 0.0f;
-  sp.attitude.yaw = 0.0f;
-  sp.thrust = thrust;
-
-  // Send setpoint continuously in the loop
-  commanderSetSetpoint(&sp, xTaskGetTickCount());
+static inline void forceKalmanAndReset(void) {
+  const paramVarId_t idEst   = paramGetVarId("stabilizer", "estimator");
+  const paramVarId_t idReset = paramGetVarId("kalman", "resetEstimation");
+  if (PARAM_VARID_IS_VALID(idEst))   { paramSetInt(idEst, 2); } // 2 = Kalman
+  if (PARAM_VARID_IS_VALID(idReset)) { paramSetInt(idReset, 1); vTaskDelay(pdMS_TO_TICKS(100)); paramSetInt(idReset, 0); }
 }
 
-static void flightRoutineOnce(void) {
-  // Ramps and holds over time, calling sendThrustSetpoint() every LOOP_DT_MS
-  const int takeoffSteps = TAKEOFF_RAMP_MS / LOOP_DT_MS;
-  const int hoverSteps   = HOVER_MS / LOOP_DT_MS;
-  const int landSteps    = LAND_RAMP_MS / LOOP_DT_MS;
-
-  // Takeoff ramp
-  for (int i = 0; i < takeoffSteps; i++) {
-    uint16_t thr = (uint16_t)(HOVER_THRUST + (TAKEOFF_THRUST - HOVER_THRUST) * (float)i / (float)takeoffSteps);
-    sendThrustSetpoint(thr);
-    vTaskDelay(M2T(LOOP_DT_MS));
+static inline bool waitForArmed(uint32_t ms) {
+  const TickType_t t0 = xTaskGetTickCount();
+  const TickType_t to = pdMS_TO_TICKS(ms);
+  while (!supervisorIsArmed()) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+    if ((xTaskGetTickCount() - t0) > to) return false;
   }
-
-  // Hover hold
-  for (int i = 0; i < hoverSteps; i++) {
-    sendThrustSetpoint(HOVER_THRUST);
-    vTaskDelay(M2T(LOOP_DT_MS));
-  }
-
-  // Land ramp
-  for (int i = 0; i < landSteps; i++) {
-    uint16_t thr = (uint16_t)(HOVER_THRUST * (1.0f - (float)i / (float)landSteps));
-    sendThrustSetpoint(thr);
-    vTaskDelay(M2T(LOOP_DT_MS));
-  }
-
-  // Motors off
-  sendThrustSetpoint(0);
+  return true;
 }
 
-// ---------------- App entry ----------------
+static void doTakeoffHoverLand(void) {
+  forceKalmanAndReset();
+  supervisorRequestArming(true);
+  (void)waitForArmed(ARM_TIMEOUT_MS);
+
+  crtpCommanderHighLevelTakeoff(TARGET_HEIGHT_M, 1.0f);
+  vTaskDelay(pdMS_TO_TICKS(HOVER_TIME_MS));
+
+  crtpCommanderHighLevelLand(0.0f, 0.5f);
+  vTaskDelay(pdMS_TO_TICKS(1000));
+  supervisorRequestArming(false);
+}
 
 void appMain(void) {
 #if defined(DRONE_01)
-  DEBUG_PRINT("two_at_a_time: DRONE_01 (RC aux1 triggers)\n");
+  DEBUG_PRINT("two_at_a_time: DRONE_01 (trigger=cppm.aux1<%d)\n", AUX_ACTIVE_THRESH);
 #elif defined(DRONE_02)
-  DEBUG_PRINT("two_at_a_time: DRONE_02 (watching ranging.auxMask%d bit %d)\n", (int)PEER_INDEX_TO_WATCH, (int)TRIGGER_AUX_BIT);
+  DEBUG_PRINT("two_at_a_time: DRONE_02 (trigger=ranging.auxMask%d bit %d)\n", (int)PEER_INDEX_TO_WATCH, AUX2_BIT);
 #else
-  DEBUG_PRINT("two_at_a_time: define DRONE_01 or DRONE_02 at build time!\n");
+  DEBUG_PRINT("two_at_a_time: define DRONE_NUMBER=1 or 2\n");
 #endif
 
-  flight_state_t st = ST_IDLE;
   bool lastTrig = false;
-
   while (1) {
     bool trig = triggerRequested();
     bool rising = (trig && !lastTrig);
     lastTrig = trig;
 
-    switch (st) {
-      case ST_IDLE:
-        if (rising) {
-          DEBUG_PRINT("Trigger received: takeoff sequence\n");
-          st = ST_TAKEOFF;
-        }
-        break;
-
-      case ST_TAKEOFF:
-        flightRoutineOnce();
-        st = ST_DONE;
-        DEBUG_PRINT("Sequence done\n");
-        break;
-
-      case ST_HOVER:
-      case ST_LAND:
-      case ST_DONE:
-      default:
-        // Stay done; re-arm on next rising edge if you prefer:
-        if (rising) {
-          DEBUG_PRINT("Re-triggered, starting again\n");
-          st = ST_TAKEOFF;
-        }
-        break;
+    if (rising) {
+      DEBUG_PRINT("Trigger -> takeoff/land\n");
+      doTakeoffHoverLand();
+      DEBUG_PRINT("Done\n");
     }
-
-    vTaskDelay(M2T(LOOP_DT_MS));
+    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }

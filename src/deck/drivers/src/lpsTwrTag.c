@@ -38,6 +38,32 @@
 
 #include "debug.h"
 
+// Forward declaration
+static uint8_t buildLocalAuxMask(void);
+
+// Local CPPM AUX var IDs (0xFFFF = invalid)
+static logVarId_t idAux0 = (logVarId_t)0xFFFF;
+static logVarId_t idAux1 = (logVarId_t)0xFFFF;
+static logVarId_t idAux2 = (logVarId_t)0xFFFF;
+static logVarId_t idAux3 = (logVarId_t)0xFFFF;
+
+// Build local AUX mask from cppm.aux0..aux3 (low-active < 1400 => bit set)
+static uint8_t buildLocalAuxMask(void)
+{
+  if (!logVarIdIsValid(idAux0)) {
+    idAux0 = logGetVarId("cppm", "aux0");
+    idAux1 = logGetVarId("cppm", "aux1");
+    idAux2 = logGetVarId("cppm", "aux2");
+    idAux3 = logGetVarId("cppm", "aux3");
+  }
+  uint8_t mask = 0;
+  if (logVarIdIsValid(idAux0)) { uint16_t v = logGetUint(idAux0); if (v > 0 && v < 1400) mask |= 1u << 0; }
+  if (logVarIdIsValid(idAux1)) { uint16_t v = logGetUint(idAux1); if (v > 0 && v < 1400) mask |= 1u << 1; }
+  if (logVarIdIsValid(idAux2)) { uint16_t v = logGetUint(idAux2); if (v > 0 && v < 1400) mask |= 1u << 2; }
+  if (logVarIdIsValid(idAux3)) { uint16_t v = logGetUint(idAux3); if (v > 0 && v < 1400) mask |= 1u << 3; }
+  return mask;
+}
+
 
 // TODO: ADD A TIMER THAT WHEN DRONE DOESN'T SEE ANY MESSAGE IN selfID*TIMEOUTPERIOD SECONDS, IT INITIATES A NEW RANGING
 // TODO: MOVE lastSuccessfulRanging TO ANY OVERHEARD MESSAGE INSTEAD OF ONLY WHEN IT RESPONDS TO US
@@ -451,6 +477,8 @@ static void rxcallback(dwDevice_t *dev) {
         state.h[current_receiveID] = report->selfh;
         if (current_receiveID == 0)
           state.keep_flying = report->keep_flying;
+        // Store peer AUX mask
+        state.auxMask[current_receiveID] = report->auxMask;
         state.refresh[current_receiveID] = true;
 
         if (isAnchor == 0)
@@ -573,6 +601,8 @@ static void rxcallback(dwDevice_t *dev) {
           state.h[rangingID] = report2->selfh;
           if (rangingID == 0)
             state.keep_flying = report2->keep_flying;
+          // Store peer AUX mask
+          state.auxMask[rangingID] = report2->auxMask;
           state.refresh[rangingID] = true;
 
           // DEBUG_PRINT("Received reciprocal distance measurement from ID %d: %u mm from pos (%.2f, %.2f, %.2f)\n", rangingID, report2->reciprocalDistance, (double)state.x[rangingID], (double)state.y[rangingID], (double)state.h[rangingID]);
@@ -638,7 +668,7 @@ static void rxcallback(dwDevice_t *dev) {
 #endif
         // dwNewReceive(dev);
         // dwSetDefaults(dev);
-        // dwStartReceive(dev);
+        // dwStartReceive(dev;
 // #if (MAX_SWARM_SIZE > 2)
       // }
 // #endif
