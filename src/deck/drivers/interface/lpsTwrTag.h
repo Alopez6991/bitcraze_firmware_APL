@@ -26,6 +26,7 @@ typedef struct {
   float selfGz;
   float selfh;
   bool keep_flying;
+  uint8_t auxMask;  // bit0..bit3 represent cppm.aux0..aux3 active=1
 } __attribute__((packed)) lpsTwrTagReportPayload_t;
 
 bool twrGetSwarmInfo(int robNum, uint16_t* range, float* x, float* y, float* gyroZ, float* height);

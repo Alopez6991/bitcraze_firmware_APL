@@ -106,6 +106,7 @@ typedef struct
   bool refresh[MAX_SWARM_SIZE];
   bool keep_flying;
   int failedRanging[LOCODECK_NR_OF_TWR_ANCHORS];
+  uint8_t auxMask[MAX_SWARM_SIZE];
 } swarmInfo_t;
 static swarmInfo_t state;
 
@@ -462,7 +463,7 @@ static void rxcallback(dwDevice_t *dev) {
           dist.anchorId = current_receiveID;
           dist.stdDev = 0.3; // Make this depend on type of other crazyflie
           // DEBUG_PRINT("Tag got distance to Anchor %u: %.2f m\n", current_receiveID, (double)dist.distance);
-          estimatorEnqueueDistance(&dist);
+          // estimatorEnqueueDistance(&dist);
         }
 
       // Count successful ranging for rate debug
@@ -489,6 +490,7 @@ static void rxcallback(dwDevice_t *dev) {
       report2->selfh = selfh2;
       
       report2->keep_flying = state.keep_flying;
+      report2->auxMask = buildLocalAuxMask();
       dwNewTransmit(dev);
       dwSetData(dev, (uint8_t *)&txPacket, MAC802154_HEADER_LENGTH + 2 + sizeof(lpsTwrTagReportPayload_t));
       dwWaitForResponse(dev, true);
@@ -540,6 +542,7 @@ static void rxcallback(dwDevice_t *dev) {
         report->selfh = selfh;
 
         report->keep_flying = state.keep_flying;
+        report->auxMask = buildLocalAuxMask();
         dwNewTransmit(dev);
         dwSetData(dev, (uint8_t *)&txPacket, MAC802154_HEADER_LENGTH + 2 + sizeof(lpsTwrTagReportPayload_t));
         dwWaitForResponse(dev, true);
@@ -584,7 +587,7 @@ static void rxcallback(dwDevice_t *dev) {
             dist.anchorId = rangingID;
             dist.stdDev = 0.25; // Make this depend on type of other crazyflie
             // DEBUG_PRINT("Tag got distance to Anchor %u: %.2f m\n", rangingID, (double)dist.distance);
-            estimatorEnqueueDistance(&dist);
+            // estimatorEnqueueDistance(&dist);
           }
         }
         // Update last successful ranging timestamp
@@ -681,7 +684,7 @@ static uint32_t twrTagOnEvent(dwDevice_t *dev, uwbEvent_t event)
         dwStartTransmit(dev);
       } else {
         dwNewReceive(dev);
-        dwSetDefaults(dev); 
+        dwSetDefaults(dev);
         dwStartReceive(dev);
       }
       break;
@@ -905,6 +908,11 @@ LOG_ADD(LOG_UINT16, distance1, &state.distance[1])
 LOG_ADD(LOG_UINT16, distance2, &state.distance[2])
 LOG_ADD(LOG_UINT16, distance3, &state.distance[3])
 LOG_ADD(LOG_UINT16, distance4, &state.distance[4])
+LOG_ADD(LOG_UINT8,  auxMask0, &state.auxMask[0])
+LOG_ADD(LOG_UINT8,  auxMask1, &state.auxMask[1])
+LOG_ADD(LOG_UINT8,  auxMask2, &state.auxMask[2])
+LOG_ADD(LOG_UINT8,  auxMask3, &state.auxMask[3])
+LOG_ADD(LOG_UINT8,  auxMask4, &state.auxMask[4])
 LOG_GROUP_STOP(ranging)
 
 PARAM_GROUP_START(swarm)
