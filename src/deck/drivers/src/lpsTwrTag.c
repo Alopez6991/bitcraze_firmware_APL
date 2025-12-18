@@ -133,6 +133,8 @@ typedef struct
   bool keep_flying;
   int failedRanging[LOCODECK_NR_OF_TWR_ANCHORS];
   uint8_t auxMask[MAX_SWARM_SIZE];
+  // Shared AUX channels (AUX0..AUX3), updated by any received auxMask
+  uint8_t aux[4];
 } swarmInfo_t;
 static swarmInfo_t state;
 
@@ -479,6 +481,10 @@ static void rxcallback(dwDevice_t *dev) {
           state.keep_flying = report->keep_flying;
         // Store peer AUX mask
         state.auxMask[current_receiveID] = report->auxMask;
+        // Update shared AUX channels (bit 0..3 => AUX0..AUX3)
+        for (int ch = 0; ch < 4; ch++) {
+          state.aux[ch] = (report->auxMask >> ch) & 0x1;
+        }
         state.refresh[current_receiveID] = true;
 
         if (isAnchor == 0)
@@ -603,6 +609,10 @@ static void rxcallback(dwDevice_t *dev) {
             state.keep_flying = report2->keep_flying;
           // Store peer AUX mask
           state.auxMask[rangingID] = report2->auxMask;
+          // Update shared AUX channels (bit 0..3 => AUX0..AUX3)
+          for (int ch = 0; ch < 4; ch++) {
+            state.aux[ch] = (report2->auxMask >> ch) & 0x1;
+          }
           state.refresh[rangingID] = true;
 
           // DEBUG_PRINT("Received reciprocal distance measurement from ID %d: %u mm from pos (%.2f, %.2f, %.2f)\n", rangingID, report2->reciprocalDistance, (double)state.x[rangingID], (double)state.y[rangingID], (double)state.h[rangingID]);
@@ -938,11 +948,11 @@ LOG_ADD(LOG_UINT16, distance1, &state.distance[1])
 LOG_ADD(LOG_UINT16, distance2, &state.distance[2])
 LOG_ADD(LOG_UINT16, distance3, &state.distance[3])
 LOG_ADD(LOG_UINT16, distance4, &state.distance[4])
-LOG_ADD(LOG_UINT8,  auxMask0, &state.auxMask[0])
-LOG_ADD(LOG_UINT8,  auxMask1, &state.auxMask[1])
-LOG_ADD(LOG_UINT8,  auxMask2, &state.auxMask[2])
-LOG_ADD(LOG_UINT8,  auxMask3, &state.auxMask[3])
-LOG_ADD(LOG_UINT8,  auxMask4, &state.auxMask[4])
+// Replace per-peer auxMask logs with 4 shared AUX channels
+LOG_ADD(LOG_UINT8,  aux0, &state.aux[0])
+LOG_ADD(LOG_UINT8,  aux1, &state.aux[1])
+LOG_ADD(LOG_UINT8,  aux2, &state.aux[2])
+LOG_ADD(LOG_UINT8,  aux3, &state.aux[3])
 LOG_GROUP_STOP(ranging)
 
 PARAM_GROUP_START(swarm)
