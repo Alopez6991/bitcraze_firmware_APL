@@ -86,6 +86,9 @@ static locoAddress_t selfAddress;
 // Swarm size: total number of crazyflies in the swarm (including self)
 static uint8_t swarmSize = MAX_SWARM_SIZE;
 
+// Only this drone ID is allowed to publish AUX (default: 1)
+static uint8_t auxPublisherId = 1;
+
 static inline uint8_t effectiveSwarmSize(void) {
   uint8_t n = swarmSize;
   if (n < 1) n = 1; // at least self
@@ -481,9 +484,11 @@ static void rxcallback(dwDevice_t *dev) {
           state.keep_flying = report->keep_flying;
         // Store peer AUX mask
         state.auxMask[current_receiveID] = report->auxMask;
-        // Update shared AUX channels (bit 0..3 => AUX0..AUX3)
-        for (int ch = 0; ch < 4; ch++) {
-          state.aux[ch] = (report->auxMask >> ch) & 0x1;
+        // Only accept AUX from the designated publisher
+        if (current_receiveID == auxPublisherId) {
+          for (int ch = 0; ch < 4; ch++) {
+            state.aux[ch] = (report->auxMask >> ch) & 0x1;
+          }
         }
         state.refresh[current_receiveID] = true;
 
@@ -524,7 +529,13 @@ static void rxcallback(dwDevice_t *dev) {
       report2->selfh = selfh2;
       
       report2->keep_flying = state.keep_flying;
-      report2->auxMask = buildLocalAuxMask();
+      uint8_t localMask2 = (selfID == auxPublisherId) ? buildLocalAuxMask() : 0;
+      report2->auxMask = localMask2;
+      if (selfID == auxPublisherId) {
+        for (int ch = 0; ch < 4; ch++) {
+          state.aux[ch] = (localMask2 >> ch) & 0x1;
+        }
+      }
       dwNewTransmit(dev);
       dwSetData(dev, (uint8_t *)&txPacket, MAC802154_HEADER_LENGTH + 2 + sizeof(lpsTwrTagReportPayload_t));
       dwWaitForResponse(dev, true);
@@ -609,9 +620,11 @@ static void rxcallback(dwDevice_t *dev) {
             state.keep_flying = report2->keep_flying;
           // Store peer AUX mask
           state.auxMask[rangingID] = report2->auxMask;
-          // Update shared AUX channels (bit 0..3 => AUX0..AUX3)
-          for (int ch = 0; ch < 4; ch++) {
-            state.aux[ch] = (report2->auxMask >> ch) & 0x1;
+          // Only accept AUX from the designated publisher
+          if (rangingID == auxPublisherId) {
+            for (int ch = 0; ch < 4; ch++) {
+              state.aux[ch] = (report2->auxMask >> ch) & 0x1;
+            }
           }
           state.refresh[rangingID] = true;
 
@@ -959,5 +972,7 @@ PARAM_GROUP_START(swarm)
 /**
  * @brief Number of crazyflies in the swarm (including self)
  */
-PARAM_ADD(PARAM_UINT8 | PARAM_PERSISTENT, size, &swarmSize)
+PARAM_ADD(PARAM_UINT8 | PARAM_PERSISTENT, size,   &swarmSize)
+// Drone ID that is allowed to publish shared AUX (default 1)
+PARAM_ADD(PARAM_UINT8 | PARAM_PERSISTENT, auxPub, &auxPublisherId)
 PARAM_GROUP_STOP(swarm)
