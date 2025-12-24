@@ -38,7 +38,7 @@
 #endif
 
 #ifndef DIST0_ABORT_MM
-#define DIST0_ABORT_MM 4000U   // outer emergency bound (mm)
+#define DIST0_ABORT_MM 2500U   // outer emergency bound (mm)
 #endif
 #ifndef DIST0_HYST_MM
 #define DIST0_HYST_MM 100U          // hysteresis margin
@@ -62,7 +62,7 @@
 #endif
 // New: near-limit on distance2 (1 m)
 #ifndef DIST2_CLOSE_MM
-#define DIST2_CLOSE_MM 1000U
+#define DIST2_CLOSE_MM 1400U
 #endif
 #ifndef DIST2_HYST_MM
 #define DIST2_HYST_MM 100U
@@ -73,6 +73,23 @@
 #define ABORT_CONFIRM_COUNT 5
 #endif
 
+// --- Avoidance parameters (drone 1 = CW yaw) ---
+#ifndef AVOID_SPEED_FACTOR
+#define AVOID_SPEED_FACTOR 0.5f      // slow to 1/2 speed
+#endif
+#ifndef AVOID_YAW_RATE_DPS
+#define AVOID_YAW_RATE_DPS 30.0f     // CW yaw rate for avoidance
+#endif
+#ifndef DIST2_AVOID_MM
+#define DIST2_AVOID_MM DIST2_CLOSE_MM
+#endif
+#ifndef DIST2_AVOID_HYST_MM
+#define DIST2_AVOID_HYST_MM DIST2_HYST_MM
+#endif
+#ifndef AVOID_CONFIRM_COUNT
+#define AVOID_CONFIRM_COUNT ABORT_CONFIRM_COUNT
+#endif
+
 static logVarId_t idAux0 = (logVarId_t)0xFFFF;
 static logVarId_t idDistance0 = (logVarId_t)0xFFFF;
 static logVarId_t idZ = (logVarId_t)0xFFFF;
@@ -81,10 +98,17 @@ static logVarId_t idDistance2 = (logVarId_t)0xFFFF;
 
 static uint8_t abortOverCount = 0;
 // New: counter for near-limit
-static uint8_t closeUnderCount = 0;
+static uint8_t closeUnderCount __attribute__((unused)) = 0;
 // New: inner bound enter/exit confirmation
 static uint8_t innerOverCount = 0;
 static uint8_t innerUnderCount = 0;
+
+// Avoidance state
+static bool avoidActive = false;
+static uint32_t lastD2 = 0;
+static bool lastD2Valid = false;
+static uint8_t approachCount = 0;
+static uint8_t departCount = 0;
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
@@ -152,24 +176,57 @@ static bool checkAndMaybeEmergencyLand(void) {
     }
   }
 
-  if (logVarIdIsValid(idDistance2)) {
-    const uint32_t d2 = logGetUint(idDistance2);
-    if (d2 > 0 && d2 < (DIST2_CLOSE_MM - DIST2_HYST_MM)) {
-      if (closeUnderCount < 0xFF) closeUnderCount++;
-      if (closeUnderCount >= ABORT_CONFIRM_COUNT) {
-        if (!seqAbort) {
-          DEBUG_PRINT("Emergency NEAR: distance2=%lu mm (< %u-%u)\n",
-                      (unsigned long)d2, DIST2_CLOSE_MM, DIST2_HYST_MM);
-        }
-        seqAbort = true;
-        trigger = true;
+  // NOTE: distance2 no longer triggers emergency land; handled by avoidance mode
+  return trigger;
+}
+
+// Decide avoidance activation based on distance2 and its derivative
+static bool updateAvoidanceMode(void) {
+  ensureLogId(&idDistance2, "ranging", "distance2");
+  if (!logVarIdIsValid(idDistance2)) {
+    return false;
+  }
+
+  const uint32_t d2 = logGetUint(idDistance2);
+  const int32_t dd2 = lastD2Valid ? ((int32_t)d2 - (int32_t)lastD2) : 0;
+  const bool approaching = lastD2Valid && (dd2 < 0);
+  const bool departing  = lastD2Valid && (dd2 > 0);
+
+  lastD2 = d2;
+  lastD2Valid = true;
+
+  if (!avoidActive) {
+    if (d2 > 0 && d2 <= DIST2_AVOID_MM && approaching) {
+      if (++approachCount >= AVOID_CONFIRM_COUNT) {
+        avoidActive = true;
+        approachCount = 0;
+        departCount = 0;
+        DEBUG_PRINT("AVOID start: d2=%lu mm, dd2=%ld\n", (unsigned long)d2, (long)dd2);
       }
     } else {
-      closeUnderCount = 0;
+      approachCount = 0;
+    }
+  } else {
+    // Stop avoidance when departing for a bit (regardless of threshold), with hysteresis backup
+    if (departing) {
+      if (++departCount >= AVOID_CONFIRM_COUNT) {
+        avoidActive = false;
+        departCount = 0;
+        approachCount = 0;
+        DEBUG_PRINT("AVOID stop: d2=%lu mm, dd2=%ld\n", (unsigned long)d2, (long)dd2);
+      }
+    } else if (d2 >= (DIST2_AVOID_MM + DIST2_AVOID_HYST_MM)) {
+      // If already beyond hysteresis band, stop immediately
+      avoidActive = false;
+      departCount = 0;
+      approachCount = 0;
+      DEBUG_PRINT("AVOID stop (hyst): d2=%lu mm\n", (unsigned long)d2);
+    } else {
+      departCount = 0;
     }
   }
 
-  return trigger;
+  return avoidActive;
 }
 
 static void landEmergency(void) {
@@ -251,8 +308,8 @@ static void runSequence(void) {
   innerOverCount = innerUnderCount = 0;
   uint8_t routines = 0;  // count of (exit inner bound -> re-enter) cycles
 
-  DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; land if d0>=%u or d2<%u; stop after 2 routines\n",
-              INNER_BOUND_MM, DIST0_ABORT_MM, DIST2_CLOSE_MM);
+  DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d2<=%u (approach), CW yaw; land if d0>=%u; stop after 2 routines\n",
+              INNER_BOUND_MM, DIST2_AVOID_MM, DIST0_ABORT_MM);
 
   // Takeoff
   rampToHeight(TARGET_HEIGHT_M, RAMP_TIME_MS);
@@ -261,8 +318,8 @@ static void runSequence(void) {
   enum { STRAIGHT = 0, TURN = 1 } mode = STRAIGHT;
   const uint32_t dtMs = 20;
 
-  while (!seqAbort && routines < 3) {
-    // Emergency checks (outer bound or distance2 close)
+  while (!seqAbort && routines < 2) {
+    // Emergency checks (outer bound)
     if (checkAndMaybeEmergencyLand()) break;
 
     // Read distance0
@@ -293,8 +350,11 @@ static void runSequence(void) {
       }
     }
 
-    // Commands
-    if (mode == STRAIGHT) {
+    // Avoidance overrides the normal command
+    const bool avoid = updateAvoidanceMode();
+    if (avoid) {
+      sendHover(FWD_SPEED_MPS * AVOID_SPEED_FACTOR, 0.0f, TARGET_HEIGHT_M, AVOID_YAW_RATE_DPS);
+    } else if (mode == STRAIGHT) {
       sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, 0.0f);
     } else {
       sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, TURN_YAW_RATE_DPS);
@@ -312,8 +372,8 @@ static void runSequence(void) {
 }
 
 void appMain(void) {
-  DEBUG_PRINT("AUX0<%d triggers; inner=%u mm (turn), outer=%u mm (land), dist2<%u mm (land)\n",
-              AUX_ACTIVE_THRESH, INNER_BOUND_MM, DIST0_ABORT_MM, DIST2_CLOSE_MM);
+  DEBUG_PRINT("AUX0<%d triggers; inner=%u mm (turn), outer=%u mm (land), avoidance on d2<=%u (CW)\n",
+              AUX_ACTIVE_THRESH, INNER_BOUND_MM, DIST0_ABORT_MM, DIST2_AVOID_MM);
 
   // Resolve required log IDs
   while (!logVarIdIsValid(idAux0) || !logVarIdIsValid(idDistance0) || !logVarIdIsValid(idDistance2)) {

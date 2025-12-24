@@ -34,14 +34,32 @@
 #endif
 
 #ifndef DIST0_ABORT_MM
-#define DIST0_ABORT_MM 4000U   // outer emergency bound (mm)
+#define DIST0_ABORT_MM 3500U   // outer emergency bound (mm)
 #endif
 #ifndef DIST0_HYST_MM
 #define DIST0_HYST_MM 100U          // hysteresis margin
 #endif
 #ifndef ABORT_CONFIRM_COUNT
-#define ABORT_CONFIRM_COUNT 5       // require N consecutive samples
+#define ABORT_CONFIRM_COUNT 5
 #endif
+
+// --- Avoidance parameters (drone 2 = CCW yaw) ---
+#ifndef AVOID_SPEED_FACTOR
+#define AVOID_SPEED_FACTOR 0.5f      // slow to 1/2 speed
+#endif
+#ifndef AVOID_YAW_RATE_DPS
+#define AVOID_YAW_RATE_DPS -30.0f    // CCW yaw rate for avoidance
+#endif
+#ifndef DIST1_AVOID_MM
+#define DIST1_AVOID_MM DIST1_CLOSE_MM
+#endif
+#ifndef DIST1_AVOID_HYST_MM
+#define DIST1_AVOID_HYST_MM DIST1_HYST_MM
+#endif
+#ifndef AVOID_CONFIRM_COUNT
+#define AVOID_CONFIRM_COUNT ABORT_CONFIRM_COUNT
+#endif
+
 #ifndef LAND_VZ_MPS
 #define LAND_VZ_MPS 0.4f            // descent speed
 #endif
@@ -50,7 +68,7 @@
 #endif
 // Abort if distance1 is closer than 1 m (with hysteresis)
 #ifndef DIST1_CLOSE_MM
-#define DIST1_CLOSE_MM 1000U
+#define DIST1_CLOSE_MM 1400U
 #endif
 #ifndef DIST1_HYST_MM
 #define DIST1_HYST_MM 100U
@@ -74,11 +92,18 @@ static logVarId_t idZ           = (logVarId_t)0xFFFF;
 static logVarId_t idDistance1   = (logVarId_t)0xFFFF;
 
 static uint8_t abortOverCount   = 0;
-// Add: counter for near-limit
-static uint8_t closeUnderCount  = 0;
+// Remove near-limit land counter usage; keep var if needed elsewhere
+static uint8_t closeUnderCount __attribute__((unused)) = 0;
 // Inner bound enter/exit confirmation
 static uint8_t innerOverCount  = 0;
 static uint8_t innerUnderCount = 0;
+
+// Avoidance state
+static bool avoidActive = false;
+static uint32_t lastD1 = 0;
+static bool lastD1Valid = false;
+static uint8_t approachCount = 0;
+static uint8_t departCount = 0;
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
@@ -124,10 +149,9 @@ static inline float getZ(void) {
   return logGetFloat(idZ);
 }
 
-// Emergency checker: distance0 > threshold OR distance1 < 1 m (both with hysteresis)
+// Emergency checker: only outer bound on distance0
 static bool checkAndMaybeEmergencyLand(void) {
   ensureLogId(&idDistance0, "ranging", "distance0");
-  ensureLogId(&idDistance1, "ranging", "distance1");
   bool trigger = false;
 
   if (logVarIdIsValid(idDistance0)) {
@@ -147,24 +171,57 @@ static bool checkAndMaybeEmergencyLand(void) {
     }
   }
 
-  if (logVarIdIsValid(idDistance1)) {
-    const uint32_t d1 = logGetUint(idDistance1);
-    if (d1 > 0 && d1 < (DIST1_CLOSE_MM - DIST1_HYST_MM)) {
-      if (closeUnderCount < 0xFF) closeUnderCount++;
-      if (closeUnderCount >= ABORT_CONFIRM_COUNT) {
-        if (!seqAbort) {
-          DEBUG_PRINT("Emergency NEAR: distance1=%lu mm (< %u-%u)\n",
-                      (unsigned long)d1, DIST1_CLOSE_MM, DIST1_HYST_MM);
-        }
-        seqAbort = true;
-        trigger = true;
+  // NOTE: distance1 no longer triggers emergency land; handled by avoidance mode
+  return trigger;
+}
+
+// Decide avoidance activation based on distance1 and its derivative (approaching/departing)
+static bool updateAvoidanceMode(void) {
+  ensureLogId(&idDistance1, "ranging", "distance1");
+  if (!logVarIdIsValid(idDistance1)) {
+    return false;
+  }
+
+  const uint32_t d1 = logGetUint(idDistance1);
+  const int32_t dd1 = lastD1Valid ? ((int32_t)d1 - (int32_t)lastD1) : 0;
+  const bool approaching = lastD1Valid && (dd1 < 0);
+  const bool departing  = lastD1Valid && (dd1 > 0);
+
+  lastD1 = d1;
+  lastD1Valid = true;
+
+  if (!avoidActive) {
+    if (d1 > 0 && d1 <= DIST1_AVOID_MM && approaching) {
+      if (++approachCount >= AVOID_CONFIRM_COUNT) {
+        avoidActive = true;
+        approachCount = 0;
+        departCount = 0;
+        DEBUG_PRINT("AVOID start: d1=%lu mm, dd1=%ld\n", (unsigned long)d1, (long)dd1);
       }
     } else {
-      closeUnderCount = 0;
+      approachCount = 0;
+    }
+  } else {
+    // Stop avoidance when departing for a bit (regardless of threshold), with hysteresis backup
+    if (departing) {
+      if (++departCount >= AVOID_CONFIRM_COUNT) {
+        avoidActive = false;
+        departCount = 0;
+        approachCount = 0;
+        DEBUG_PRINT("AVOID stop: d1=%lu mm, dd1=%ld\n", (unsigned long)d1, (long)dd1);
+      }
+    } else if (d1 >= (DIST1_AVOID_MM + DIST1_AVOID_HYST_MM)) {
+      // If already beyond hysteresis band, stop immediately
+      avoidActive = false;
+      departCount = 0;
+      approachCount = 0;
+      DEBUG_PRINT("AVOID stop (hyst): d1=%lu mm\n", (unsigned long)d1);
+    } else {
+      departCount = 0;
     }
   }
 
-  return trigger;
+  return avoidActive;
 }
 
 static void landEmergency(void) {
@@ -246,8 +303,8 @@ static void runSequence(void) {
   innerOverCount = innerUnderCount = 0;
   uint8_t routines = 0;  // count of (exit inner bound -> re-enter) cycles
 
-  DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; land if d0>=%u or d1<%u; stop after 2 routines\n",
-              INNER_BOUND_MM, DIST0_ABORT_MM, DIST1_CLOSE_MM);
+  DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d1<=%u (approach), CCW yaw; land if d0>=%u; stop after 2 routines\n",
+              INNER_BOUND_MM, DIST1_AVOID_MM, DIST0_ABORT_MM);
 
   // Takeoff
   rampToHeight(TARGET_HEIGHT_M, RAMP_TIME_MS);
@@ -256,8 +313,8 @@ static void runSequence(void) {
   enum { STRAIGHT = 0, TURN = 1 } mode = STRAIGHT;
   const uint32_t dtMs = 20;
 
-  while (!seqAbort && routines < 3) {
-    // Emergency checks (outer bound or distance1 close)
+  while (!seqAbort && routines < 2) {
+    // Emergency checks (outer bound)
     if (checkAndMaybeEmergencyLand()) break;
 
     // Read distance0
@@ -288,8 +345,11 @@ static void runSequence(void) {
       }
     }
 
-    // Commands
-    if (mode == STRAIGHT) {
+    // Avoidance overrides the normal command
+    const bool avoid = updateAvoidanceMode();
+    if (avoid) {
+      sendHover(FWD_SPEED_MPS * AVOID_SPEED_FACTOR, 0.0f, TARGET_HEIGHT_M, AVOID_YAW_RATE_DPS);
+    } else if (mode == STRAIGHT) {
       sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, 0.0f);
     } else {
       sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, TURN_YAW_RATE_DPS);
@@ -307,8 +367,8 @@ static void runSequence(void) {
 }
 
 void appMain(void) {
-  DEBUG_PRINT("drone_2_task: ranging.aux1 triggers; inner=%u mm (turn), outer=%u mm (land), dist1<%u mm (land)\n",
-              INNER_BOUND_MM, DIST0_ABORT_MM, DIST1_CLOSE_MM);
+  DEBUG_PRINT("drone_2_task: ranging.aux1 triggers; inner=%u mm (turn), outer=%u mm (land), avoidance on d1<=%u (CCW)\n",
+              INNER_BOUND_MM, DIST0_ABORT_MM, DIST1_AVOID_MM);
   // Resolve required log IDs
   while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idDistance0) || !logVarIdIsValid(idDistance1)) {
     ensureLogId(&idRangingAux1, "ranging", "aux1");
