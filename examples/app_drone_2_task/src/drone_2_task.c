@@ -34,7 +34,7 @@
 #endif
 
 #ifndef DIST0_ABORT_MM
-#define DIST0_ABORT_MM 4000U   // outer emergency bound (mm)
+#define DIST0_ABORT_MM 3500U   // outer emergency bound (mm)
 #endif
 #ifndef DIST0_HYST_MM
 #define DIST0_HYST_MM 100U          // hysteresis margin
@@ -64,7 +64,7 @@
 #endif
 // Yaw rate while turning (deg/s)
 #ifndef TURN_YAW_RATE_DPS
-#define TURN_YAW_RATE_DPS 20.0f
+#define TURN_YAW_RATE_DPS 30.0f
 #endif
 
 static logVarId_t idRangingAux1 = (logVarId_t)0xFFFF;
