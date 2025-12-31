@@ -97,6 +97,7 @@
 #endif
 
 static logVarId_t idRangingAux1 = (logVarId_t)0xFFFF;
+static logVarId_t idRangingAux2 = (logVarId_t)0xFFFF;
 static logVarId_t idDistance0   = (logVarId_t)0xFFFF;
 static logVarId_t idZ           = (logVarId_t)0xFFFF;
 // Add: distance1
@@ -132,6 +133,35 @@ static inline bool sharedAux1Active(void) {
   if (!logVarIdIsValid(idRangingAux1)) return false;
   const uint32_t v = logGetUint(idRangingAux1);
   return v > 0;
+}
+
+// Kill switch: ranging.aux2 > 0
+static inline bool sharedAux2Active(void) {
+  ensureLogId(&idRangingAux2, "ranging", "aux2");
+  if (!logVarIdIsValid(idRangingAux2)) return false;
+  const uint32_t v = logGetUint(idRangingAux2);
+  return v > 0;
+}
+
+// Immediate disarm: cut all controllers and thrust
+static void killDisarm(void) {
+  setpoint_t cut; memset(&cut, 0, sizeof(cut));
+  cut.mode.x = modeDisable;
+  cut.mode.y = modeDisable;
+  cut.mode.z = modeDisable;
+  cut.mode.yaw = modeDisable;
+  cut.thrust = 0;
+  for (int i = 0; i < 100; i++) {          // ~1 s to ensure radio gets it
+    commanderSetSetpoint(&cut, 3);
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
+  seqAbort = true;
+  DEBUG_PRINT("KILL: AUX2 active -> disarm\n");
+}
+
+static inline bool checkKillAndDisarm(void) {
+  if (sharedAux2Active()) { killDisarm(); return true; }
+  return false;
 }
 
 // Send a hover/vel setpoint (body frame XY, absolute Z)
@@ -265,6 +295,7 @@ static void rampToHeight(float zTarget, uint32_t rampMs) {
   const uint32_t dtMs = 20;
   const uint32_t steps = (rampMs / dtMs) ? (rampMs / dtMs) : 1;
   for (uint32_t i = 0; i <= steps; i++) {
+    if (checkKillAndDisarm()) return;
     if (checkAndMaybeEmergencyLand()) return;
     const float z = (zTarget * (float)i) / (float)steps;
     sendHover(0.0f, 0.0f, z, 0.0f);
@@ -314,6 +345,9 @@ static void runSequence(void) {
   DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d1<=%u, CCW yaw; land if d0>=%u; stop after 2 routines\n",
               INNER_BOUND_MM, DIST1_AVOID_MM, DIST0_ABORT_MM);
 
+  // Kill before takeoff
+  if (checkKillAndDisarm()) return;
+
   // Takeoff
   rampToHeight(TARGET_HEIGHT_M, RAMP_TIME_MS);
   if (seqAbort) { landEmergency(); return; }
@@ -322,6 +356,9 @@ static void runSequence(void) {
   const uint32_t dtMs = 20;
 
   while (!seqAbort && routines < 2) {
+    // Kill supersedes everything
+    if (checkKillAndDisarm()) break;
+
     // Emergency checks (outer bound)
     if (checkAndMaybeEmergencyLand()) break;
 
@@ -378,9 +415,12 @@ static void runSequence(void) {
 void appMain(void) {
   DEBUG_PRINT("drone_2_task: ranging.aux1 triggers; inner=%u mm (turn), outer=%u mm (land), avoidance on d1<=%u (CCW)\n",
               INNER_BOUND_MM, DIST0_ABORT_MM, DIST1_AVOID_MM);
-  // Resolve required log IDs
-  while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idDistance0) || !logVarIdIsValid(idDistance1)) {
+
+  // Resolve required log IDs (include aux2 for kill)
+  while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idRangingAux2) ||
+         !logVarIdIsValid(idDistance0) || !logVarIdIsValid(idDistance1)) {
     ensureLogId(&idRangingAux1, "ranging", "aux1");
+    ensureLogId(&idRangingAux2, "ranging", "aux2");
     ensureLogId(&idDistance0,   "ranging", "distance0");
     ensureLogId(&idDistance1,   "ranging", "distance1");
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -390,6 +430,15 @@ void appMain(void) {
 
   bool wasActive = false;
   while (1) {
+    // KILL: disarm immediately, supersedes everything
+    if (sharedAux2Active()) {
+      ledSet(LED_BLUE_L, false);
+      killDisarm();
+      // stay disarmed while aux2 is held
+      while (sharedAux2Active()) { vTaskDelay(pdMS_TO_TICKS(20)); }
+      ledSet(LED_BLUE_L, true);
+    }
+
     const bool active = sharedAux1Active();
 
     // Emergency always active, even when idle
