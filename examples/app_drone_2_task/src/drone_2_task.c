@@ -355,7 +355,7 @@ static void runSequence(void) {
   enum { STRAIGHT = 0, TURN = 1 } mode = STRAIGHT;
   const uint32_t dtMs = 20;
 
-  while (!seqAbort && routines < 2) {
+  while (!seqAbort && routines < 5) {
     // Kill supersedes everything
     if (checkKillAndDisarm()) break;
 
