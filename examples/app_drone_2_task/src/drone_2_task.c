@@ -17,6 +17,28 @@
 #include "commander.h"
 #include "stabilizer_types.h"
 
+// Add missing log IDs used below
+static logVarId_t idRangingAux1 = (logVarId_t)0xFFFF;
+static logVarId_t idRangingAux2 = (logVarId_t)0xFFFF;
+static logVarId_t idDistance0   = (logVarId_t)0xFFFF;
+static logVarId_t idDistance1   = (logVarId_t)0xFFFF;
+static logVarId_t idZ           = (logVarId_t)0xFFFF;
+
+// Add Multiranger up log id
+static logVarId_t idUp = (logVarId_t)0xFFFF;
+
+// Add obstacle counters/flags (match task 1)
+static uint8_t obstUnderCount = 0;
+static bool obstLatched = false;                      // latch until cleared by hysteresis
+static volatile bool obstacleActionRequested = false; // execute back+turn maneuver
+
+// Fix: missing avoidance state used by updateAvoidanceMode()
+static bool avoidActive = false;
+static uint8_t approachCount = 0;
+static uint8_t departCount = 0;
+static uint32_t lastD1 __attribute__((unused)) = 0;
+static bool lastD1Valid __attribute__((unused)) = false;
+
 #ifndef TARGET_HEIGHT_M
 #define TARGET_HEIGHT_M 0.8f
 #endif
@@ -37,52 +59,7 @@
 #define DIST0_ABORT_MM 3500U   // outer emergency bound (mm)
 #endif
 #ifndef DIST0_HYST_MM
-#define DIST0_HYST_MM 100U          // hysteresis margin
-#endif
-#ifndef ABORT_CONFIRM_COUNT
-#define ABORT_CONFIRM_COUNT 5
-#endif
-// Stronger exit requirement: many consecutive "departing" samples
-#ifndef AVOID_ENTER_CONFIRM_COUNT
-#define AVOID_ENTER_CONFIRM_COUNT 2                     // very few samples to enter
-#endif
-#ifndef AVOID_EXIT_CONFIRM_COUNT
-#define AVOID_EXIT_CONFIRM_COUNT 20                     // stop avoidance after sustained departing
-#endif
-// Minimum distance during avoidance: land if closer than 0.5 m
-#ifndef AVOID_MIN_LAND_MM
-#define AVOID_MIN_LAND_MM 500U
-#endif
-
-// --- Avoidance parameters (drone 2 = CCW yaw) ---
-#ifndef AVOID_SPEED_FACTOR
-#define AVOID_SPEED_FACTOR 1.0f      // half speed during avoidance
-#endif
-#ifndef AVOID_YAW_RATE_DPS
-#define AVOID_YAW_RATE_DPS -70.0f    // CCW yaw rate for avoidance
-#endif
-#ifndef DIST1_AVOID_MM
-#define DIST1_AVOID_MM DIST1_CLOSE_MM
-#endif
-#ifndef DIST1_AVOID_HYST_MM
-#define DIST1_AVOID_HYST_MM DIST1_HYST_MM
-#endif
-#ifndef AVOID_CONFIRM_COUNT
-#define AVOID_CONFIRM_COUNT ABORT_CONFIRM_COUNT
-#endif
-
-#ifndef LAND_VZ_MPS
-#define LAND_VZ_MPS 0.4f            // descent speed
-#endif
-#ifndef CUT_Z_M
-#define CUT_Z_M 0.05f               // cut controllers below this altitude
-#endif
-// Abort if distance1 is closer than 1 m (with hysteresis)
-#ifndef DIST1_CLOSE_MM
-#define DIST1_CLOSE_MM 2000U
-#endif
-#ifndef DIST1_HYST_MM
-#define DIST1_HYST_MM 100U
+#define DIST0_HYST_MM 100U     // hysteresis margin
 #endif
 // Inner bound to start turning
 #ifndef INNER_BOUND_MM
@@ -93,15 +70,72 @@
 #endif
 // Yaw rate while turning (deg/s)
 #ifndef TURN_YAW_RATE_DPS
-#define TURN_YAW_RATE_DPS 30.0f
+#define TURN_YAW_RATE_DPS 40.0f
+#endif
+#ifndef LAND_VZ_MPS
+#define LAND_VZ_MPS 0.4f       // descent speed
+#endif
+#ifndef CUT_Z_M
+#define CUT_Z_M 0.05f          // cut controllers below this altitude
 #endif
 
-static logVarId_t idRangingAux1 = (logVarId_t)0xFFFF;
-static logVarId_t idRangingAux2 = (logVarId_t)0xFFFF;
-static logVarId_t idDistance0   = (logVarId_t)0xFFFF;
-static logVarId_t idZ           = (logVarId_t)0xFFFF;
-// Add: distance1
-static logVarId_t idDistance1   = (logVarId_t)0xFFFF;
+// Near-limit on distance1 (2 m) for avoidance
+#ifndef DIST1_CLOSE_MM
+#define DIST1_CLOSE_MM 2000U
+#endif
+#ifndef DIST1_HYST_MM
+#define DIST1_HYST_MM 100U
+#endif
+
+// Obstacle (up sensor) thresholds and maneuver (match task 1 style)
+#ifndef OBST_UP_THRESH_MM
+#define OBST_UP_THRESH_MM 750U     // trigger if up < 0.75 m
+#endif
+#ifndef OBST_HYST_MM
+#define OBST_HYST_MM 50U            // hysteresis margin
+#endif
+#ifndef OBST_CONFIRM_COUNT
+#define OBST_CONFIRM_COUNT 3        // samples required to confirm obstacle
+#endif
+#ifndef OBST_BACK_VX_MPS
+#define OBST_BACK_VX_MPS -0.5f      // fly backwards at 0.5 m/s (body X negative)
+#endif
+#ifndef OBST_BACKOFF_MS
+#define OBST_BACKOFF_MS 2000U       // 2 seconds back off
+#endif
+#ifndef OBST_TURN_YAW_RATE_DPS
+#define OBST_TURN_YAW_RATE_DPS 30.0f // turn in place at 30 deg/s
+#endif
+#ifndef OBST_TURN_MS
+#define OBST_TURN_MS 2000U          // 2 seconds turn
+#endif
+
+// Require N consecutive samples to trigger thresholds
+#ifndef ABORT_CONFIRM_COUNT
+#define ABORT_CONFIRM_COUNT 5
+#endif
+#ifndef AVOID_ENTER_CONFIRM_COUNT
+#define AVOID_ENTER_CONFIRM_COUNT 2
+#endif
+#ifndef AVOID_EXIT_CONFIRM_COUNT
+#define AVOID_EXIT_CONFIRM_COUNT 20
+#endif
+#ifndef AVOID_MIN_LAND_MM
+#define AVOID_MIN_LAND_MM 500U
+#endif
+#ifndef AVOID_SPEED_FACTOR
+#define AVOID_SPEED_FACTOR 1.0f      // full speed during avoidance
+#endif
+// --- Avoidance parameters (drone 2 = CCW yaw) ---
+#ifndef AVOID_YAW_RATE_DPS
+#define AVOID_YAW_RATE_DPS -70.0f    // CCW yaw rate for avoidance
+#endif
+#ifndef DIST1_AVOID_MM
+#define DIST1_AVOID_MM DIST1_CLOSE_MM
+#endif
+#ifndef DIST1_AVOID_HYST_MM
+#define DIST1_AVOID_HYST_MM DIST1_HYST_MM
+#endif
 
 static uint8_t abortOverCount   = 0;
 // Remove near-limit land counter usage; keep var if needed elsewhere
@@ -110,20 +144,22 @@ static uint8_t closeUnderCount __attribute__((unused)) = 0;
 static uint8_t innerOverCount  = 0;
 static uint8_t innerUnderCount = 0;
 
-// Avoidance state
-static bool avoidActive = false;
-static uint32_t lastD1 __attribute__((unused)) = 0;
-static bool lastD1Valid __attribute__((unused)) = false;
-static uint8_t approachCount = 0;
-static uint8_t departCount = 0;
-
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
 
-// Resolve a log var id if needed
+// Resolve a log var id if needed (should already exist in file)
 static inline void ensureLogId(logVarId_t* id, const char* group, const char* name) {
   if (!logVarIdIsValid(*id)) {
     *id = logGetVarId(group, name);
+  }
+}
+// Resolve 'up' from multiranger, with fallback to 'range'
+static inline void ensureUpLogId(void) {
+  if (!logVarIdIsValid(idUp)) {
+    idUp = logGetVarId("multiranger", "up");
+    if (!logVarIdIsValid(idUp)) {
+      idUp = logGetVarId("range", "up");
+    }
   }
 }
 
@@ -188,13 +224,18 @@ static inline float getZ(void) {
   ensureLogId(&idZ, "stateEstimate", "z");
   if (!logVarIdIsValid(idZ)) return -1.0f;
   return logGetFloat(idZ);
+  // Fallback to satisfy -Wreturn-type in all toolchains
+  return -1.0f;
 }
 
-// Emergency checker: only outer bound on distance0
+// Emergency checker: outer bound and obstacle up trigger (maneuver)
 static bool checkAndMaybeEmergencyLand(void) {
   ensureLogId(&idDistance0, "ranging", "distance0");
+  ensureUpLogId();
+
   bool trigger = false;
 
+  // Outer bound emergency on distance0
   if (logVarIdIsValid(idDistance0)) {
     const uint32_t d0 = logGetUint(idDistance0);
     if (d0 > (DIST0_ABORT_MM + DIST0_HYST_MM)) {
@@ -205,18 +246,38 @@ static bool checkAndMaybeEmergencyLand(void) {
                       (unsigned long)d0, DIST0_ABORT_MM, DIST0_HYST_MM);
         }
         seqAbort = true;
-        trigger = true;
+        trigger = true;  // caller will abort sequence
       }
     } else {
       abortOverCount = 0;
     }
   }
 
-  // NOTE: distance1 no longer triggers emergency land; handled by avoidance mode
-  return trigger;
+  // Obstacle on Multiranger 'up': request maneuver (back off + turn) instead of landing
+  if (logVarIdIsValid(idUp)) {
+    const uint32_t up = logGetUint(idUp);
+    if (up > 0 && up <= OBST_UP_THRESH_MM) {
+      if (!obstLatched) {
+        if (obstUnderCount < 0xFF) obstUnderCount++;
+        if (obstUnderCount >= OBST_CONFIRM_COUNT) {
+          obstLatched = true;                // latch until cleared by hysteresis
+          obstacleActionRequested = true;    // ask main loop to execute maneuver
+          DEBUG_PRINT("OBST UP: %lu mm (<= %u) -> maneuver requested\n",
+                      (unsigned long)up, OBST_UP_THRESH_MM);
+        }
+      }
+    } else if (up >= (OBST_UP_THRESH_MM + OBST_HYST_MM) || up == 0) {
+      // Clear latch and counter when safely out of the band or invalid
+      obstUnderCount = 0;
+      obstLatched = false;
+    }
+  }
+
+  return trigger; // true only for far-bound abort
 }
 
 // Decide avoidance activation based on distance1 only (no derivative)
+// ensure this function exists; we only rely on avoidActive/approachCount/departCount globals above
 static bool updateAvoidanceMode(void) {
   ensureLogId(&idDistance1, "ranging", "distance1");
   if (!logVarIdIsValid(idDistance1)) {
@@ -337,13 +398,32 @@ static void landToZero(uint32_t rampMs) {
   }
 }
 
+// Execute the obstacle response: back off for 2 s, then turn in place for 2 s
+static void performObstacleManeuver(void) {
+  const uint32_t dtMs = 20;
+  uint32_t steps = OBST_BACKOFF_MS / dtMs;
+  DEBUG_PRINT("OBST MANEUVER: back off for %u ms at %.2f m/s\n", OBST_BACKOFF_MS, (double)OBST_BACK_VX_MPS);
+  for (uint32_t i = 0; i < steps; i++) {
+    if (checkAndMaybeEmergencyLand()) return; // outer bound can still abort
+    sendHover(OBST_BACK_VX_MPS, 0.0f, TARGET_HEIGHT_M, 0.0f);
+    vTaskDelay(pdMS_TO_TICKS(dtMs));
+  }
+  DEBUG_PRINT("OBST MANEUVER: turn in place for %u ms at %.1f deg/s\n", OBST_TURN_MS, (double)OBST_TURN_YAW_RATE_DPS);
+  steps = OBST_TURN_MS / dtMs;
+  for (uint32_t i = 0; i < steps; i++) {
+    if (checkAndMaybeEmergencyLand()) return;
+    sendHover(0.0f, 0.0f, TARGET_HEIGHT_M, OBST_TURN_YAW_RATE_DPS);
+    vTaskDelay(pdMS_TO_TICKS(dtMs));
+  }
+}
+
 static void runSequence(void) {
   seqAbort = false;
   innerOverCount = innerUnderCount = 0;
   uint8_t routines = 0;  // count of (exit inner bound -> re-enter) cycles
 
-  DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d1<=%u, CCW yaw; land if d0>=%u; stop after 2 routines\n",
-              INNER_BOUND_MM, DIST1_AVOID_MM, DIST0_ABORT_MM);
+  DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d1<=%u, CCW yaw; OBST up<%u: back+turn; land if d0>=%u; stop after 2 routines\n",
+              INNER_BOUND_MM, DIST1_AVOID_MM, OBST_UP_THRESH_MM, DIST0_ABORT_MM);
 
   // Kill before takeoff
   if (checkKillAndDisarm()) return;
@@ -359,8 +439,16 @@ static void runSequence(void) {
     // Kill supersedes everything
     if (checkKillAndDisarm()) break;
 
-    // Emergency checks (outer bound)
+    // Emergency checks (outer bound + obstacle)
     if (checkAndMaybeEmergencyLand()) break;
+
+    // Obstacle action supersedes normal/avoidance commands
+    if (obstacleActionRequested) {
+      obstacleActionRequested = false; // consume the request
+      performObstacleManeuver();
+      // after maneuver, continue the loop
+      continue;
+    }
 
     // Read distance0
     ensureLogId(&idDistance0, "ranging", "distance0");
@@ -394,7 +482,7 @@ static void runSequence(void) {
     const bool avoid = updateAvoidanceMode();
     if (seqAbort) break;  // triggered by minimum distance during avoidance
     if (avoid) {
-      sendHover(FWD_SPEED_MPS * AVOID_SPEED_FACTOR, 0.0f, TARGET_HEIGHT_M, AVOID_YAW_RATE_DPS);
+      sendHover(FWD_SPEED_MPS * AVOID_SPEED_FACTOR, 0.0f, TARGET_HEIGHT_M, AVOID_YAW_RATE_DPS); // CCW
     } else if (mode == STRAIGHT) {
       sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, 0.0f);
     } else {
@@ -413,16 +501,18 @@ static void runSequence(void) {
 }
 
 void appMain(void) {
-  DEBUG_PRINT("drone_2_task: ranging.aux1 triggers; inner=%u mm (turn), outer=%u mm (land), avoidance on d1<=%u (CCW)\n",
-              INNER_BOUND_MM, DIST0_ABORT_MM, DIST1_AVOID_MM);
+  DEBUG_PRINT("drone_2_task: trigger via aux; inner=%u mm (turn), outer=%u mm (land), avoidance on d1<=%u (CCW), obstacle up<%u mm -> back+turn\n",
+              INNER_BOUND_MM, DIST0_ABORT_MM, DIST1_AVOID_MM, OBST_UP_THRESH_MM);
 
-  // Resolve required log IDs (include aux2 for kill)
+  // Ensure 'up' is resolved along with your existing required IDs
+  // Resolve required log IDs (include aux2 for kill, up for obstacle)
   while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idRangingAux2) ||
          !logVarIdIsValid(idDistance0) || !logVarIdIsValid(idDistance1)) {
     ensureLogId(&idRangingAux1, "ranging", "aux1");
     ensureLogId(&idRangingAux2, "ranging", "aux2");
     ensureLogId(&idDistance0,   "ranging", "distance0");
     ensureLogId(&idDistance1,   "ranging", "distance1");
+    ensureUpLogId();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 
