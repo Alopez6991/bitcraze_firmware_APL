@@ -52,7 +52,7 @@
 #endif
 // Yaw rate while turning (deg/s)
 #ifndef TURN_YAW_RATE_DPS
-#define TURN_YAW_RATE_DPS 30.0f
+#define TURN_YAW_RATE_DPS 40.0f
 #endif
 #ifndef LAND_VZ_MPS
 #define LAND_VZ_MPS 0.4f            // descent speed

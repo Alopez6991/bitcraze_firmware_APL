@@ -93,7 +93,7 @@
 #endif
 // Yaw rate while turning (deg/s)
 #ifndef TURN_YAW_RATE_DPS
-#define TURN_YAW_RATE_DPS 30.0f
+#define TURN_YAW_RATE_DPS 40.0f
 #endif
 
 static logVarId_t idRangingAux1 = (logVarId_t)0xFFFF;
