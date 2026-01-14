@@ -16,6 +16,7 @@
 #include "led.h"
 #include "commander.h"
 #include "stabilizer_types.h"
+#include "supervisor.h"
 
 #ifndef TARGET_HEIGHT_M
 #define TARGET_HEIGHT_M 0.8f
@@ -143,24 +144,12 @@ static inline bool sharedAux2Active(void) {
   return v > 0;
 }
 
-// Immediate disarm: cut all controllers and thrust
-static void killDisarm(void) {
-  setpoint_t cut; memset(&cut, 0, sizeof(cut));
-  cut.mode.x = modeDisable;
-  cut.mode.y = modeDisable;
-  cut.mode.z = modeDisable;
-  cut.mode.yaw = modeDisable;
-  cut.thrust = 0;
-  for (int i = 0; i < 100; i++) {          // ~1 s to ensure radio gets it
-    commanderSetSetpoint(&cut, 3);
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-  seqAbort = true;
-  DEBUG_PRINT("KILL: AUX2 active -> disarm\n");
-}
-
 static inline bool checkKillAndDisarm(void) {
-  if (sharedAux2Active()) { killDisarm(); return true; }
+  if (sharedAux2Active()) {
+    supervisorRequestArming(false); 
+    commanderRelaxPriority(); // somehow this is necessary to ensure that it stays disarmed
+    return true;
+  }
   return false;
 }
 
@@ -357,7 +346,7 @@ static void runSequence(void) {
 
   while (!seqAbort && routines < 5) {
     // Kill supersedes everything
-    if (checkKillAndDisarm()) break;
+    if (checkKillAndDisarm()) return;
 
     // Emergency checks (outer bound)
     if (checkAndMaybeEmergencyLand()) break;
@@ -433,7 +422,7 @@ void appMain(void) {
     // KILL: disarm immediately, supersedes everything
     if (sharedAux2Active()) {
       ledSet(LED_BLUE_L, false);
-      killDisarm();
+      supervisorRequestArming(false);
       // stay disarmed while aux2 is held
       while (sharedAux2Active()) { vTaskDelay(pdMS_TO_TICKS(20)); }
       ledSet(LED_BLUE_L, true);
