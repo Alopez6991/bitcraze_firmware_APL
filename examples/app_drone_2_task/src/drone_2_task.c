@@ -19,7 +19,7 @@
 #include "supervisor.h"
 
 #ifndef TARGET_HEIGHT_M
-#define TARGET_HEIGHT_M 0.8f
+#define TARGET_HEIGHT_M 1.0f
 #endif
 
 #ifndef FWD_SPEED_MPS
