@@ -14,7 +14,6 @@
 #include "debug.h"
 
 #include "log.h"
-#include "led.h"
 #include "commander.h"
 #include "stabilizer_types.h"
 
@@ -34,7 +33,7 @@
 #define DIST2_HYST_MM 100U
 #define ABORT_CONFIRM_COUNT 2 // Require N consecutive samples to trigger thresholds
 #define AVOID_ENTER_CONFIRM_COUNT 2
-#define AVOID_EXIT_CONFIRM_COUNT 20
+#define AVOID_EXIT_CONFIRM_COUNT 10
 #define AVOID_MIN_LAND_MM 500U
 #define AVOID_SPEED_FACTOR 1.0f      // full speed during avoidance
 #define AVOID_YAW_RATE_DPS 70.0f     // CW yaw rate for avoidance
@@ -335,23 +334,17 @@ void appMain(void) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 
-  ledSet(LED_BLUE_L, true);
-
   bool wasActive = false;
   while (1) {
     const bool active = aux0ActiveLow();
 
     // Emergency always active, even when idle
     if (checkAndMaybeEmergencyLand()) {
-      ledSet(LED_BLUE_L, false);
       landToZero();
-      ledSet(LED_BLUE_L, true);
     }
 
     if (active && !wasActive) {
-      ledSet(LED_BLUE_L, false);
       runSequence();
-      ledSet(LED_BLUE_L, true);
     }
 
     wasActive = active;
