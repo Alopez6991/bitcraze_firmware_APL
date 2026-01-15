@@ -56,7 +56,7 @@ void auxSwitchTask(void *arg)
       //   check if we need to arm/disarm
         if (auxState(3))
         {
-          if (!supervisorIsArmed())
+          if (!supervisorIsArmed() && supervisorCanArm())
           {
             supervisorRequestArming(true);
             DEBUG_PRINT("Arming with AUX3\n");

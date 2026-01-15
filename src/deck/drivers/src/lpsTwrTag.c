@@ -506,7 +506,7 @@ static void rxcallback(dwDevice_t *dev) {
         }
 
       // Count successful ranging for rate debug
-      noteSuccessfulRange();
+      // noteSuccessfulRange();
       }
 
       lpsTwrTagReportPayload_t *report2 = (lpsTwrTagReportPayload_t *)(txPacket.payload + 2);
@@ -649,7 +649,7 @@ static void rxcallback(dwDevice_t *dev) {
         rangingOk = true;
 
         // Count successful ranging for rate debug
-        noteSuccessfulRange();
+        // noteSuccessfulRange();
 #if (MAX_SWARM_SIZE > 2)
       // Instead of fixed ring protocol, use random peer selection
       // This makes the protocol more robust to individual crazyflie failures

@@ -18,135 +18,47 @@
 #include "commander.h"
 #include "stabilizer_types.h"
 
-// Forward declaration so getYawRad() can call ensureLogId() before its definition below
-static inline void ensureLogId(logVarId_t* id, const char* group, const char* name);
-
-// Normalize angle to (-PI, PI]
-static inline float normalizeAngle(float a) {
-  while (a <= -180) a += 360;
-  while (a > 180) a -= 360;
-  return a;
-}
-
-// Yaw heading log id and accessor (returns radians)
-static logVarId_t idYaw = (logVarId_t)0xFFFF;
-static inline float getYawRad(void) {
-  ensureLogId(&idYaw, "stateEstimate", "yaw");
-  float y = logGetFloat(idYaw);
-  return y;
-}
-
-// Signed displacement from start -> current along a chosen rotation direction.
-// dir = +1 for positive (CCW) rotation, dir = -1 for negative (CW) rotation.
-// We compute the shortest difference in (-PI, PI], then add/sub 2PI so the
-// displacement represents rotation in the requested direction (handles wrap).
-// static inline float displacementAlongDir(float start, float current, int dir) {
-//   float diff = normalizeAngle(current - start);
-//   if (dir > 0 && diff < 0.0f) diff += TWO_PI_F;  // enforce positive rotation amount
-//   if (dir < 0 && diff > 0.0f) diff -= TWO_PI_F;  // enforce negative rotation amount
-//   return diff;
-// }
-
-#ifndef AUX_ACTIVE_THRESH
 #define AUX_ACTIVE_THRESH 1400
-#endif
-
-#ifndef TARGET_HEIGHT_M
 #define TARGET_HEIGHT_M 1.0f
-#endif
-
-#ifndef FWD_SPEED_MPS
 #define FWD_SPEED_MPS 0.5f
-#endif
-
-#ifndef SEGMENT_TIME_MS
 #define SEGMENT_TIME_MS 8000U
-#endif
-
-#ifndef RAMP_TIME_MS
 #define RAMP_TIME_MS 1500U
-#endif
-
-#ifndef DIST0_ABORT_MM
 #define DIST0_ABORT_MM 3500U   // outer emergency bound (mm)
-#endif
-#ifndef DIST0_HYST_MM
 #define DIST0_HYST_MM 100U          // hysteresis margin
-#endif
-// Inner bound to start turning
-#ifndef INNER_BOUND_MM
-#define INNER_BOUND_MM 1750U
-#endif
-#ifndef INNER_HYST_MM
+#define INNER_BOUND_MM 1750U // Inner bound to start turning
 #define INNER_HYST_MM 100U
-#endif
-// Yaw rate while turning (deg/s)
-#ifndef TURN_YAW_RATE_DPS
-#define TURN_YAW_RATE_DPS 40.0f
-#endif
-#ifndef LAND_VZ_MPS
+#define TURN_YAW_RATE_DPS 40.0f // Yaw rate while turning (deg/s)
 #define LAND_VZ_MPS 0.4f            // descent speed
-#endif
-#ifndef CUT_Z_M
 #define CUT_Z_M 0.05f               // cut controllers below this altitude
-#endif
-// New: near-limit on distance2 (1 m)
-#ifndef DIST2_CLOSE_MM
-#define DIST2_CLOSE_MM 2000U
-#endif
-#ifndef DIST2_HYST_MM
+#define DIST2_CLOSE_MM 2000U // near-limit on distance2 (2m)
 #define DIST2_HYST_MM 100U
-#endif
-
-// Require N consecutive samples to trigger thresholds
-#ifndef ABORT_CONFIRM_COUNT
-#define ABORT_CONFIRM_COUNT 5
-#endif
-#ifndef AVOID_ENTER_CONFIRM_COUNT
+#define ABORT_CONFIRM_COUNT 2 // Require N consecutive samples to trigger thresholds
 #define AVOID_ENTER_CONFIRM_COUNT 2
-#endif
-#ifndef AVOID_EXIT_CONFIRM_COUNT
 #define AVOID_EXIT_CONFIRM_COUNT 20
-#endif
-#ifndef AVOID_MIN_LAND_MM
 #define AVOID_MIN_LAND_MM 500U
-#endif
-#ifndef AVOID_SPEED_FACTOR
 #define AVOID_SPEED_FACTOR 1.0f      // full speed during avoidance
-#endif
-// --- Avoidance parameters (drone 1 = CW yaw) ---
-#ifndef AVOID_YAW_RATE_DPS
 #define AVOID_YAW_RATE_DPS 70.0f     // CW yaw rate for avoidance
-#endif
-#ifndef DIST2_AVOID_MM
 #define DIST2_AVOID_MM DIST2_CLOSE_MM
-#endif
-#ifndef DIST2_AVOID_HYST_MM
 #define DIST2_AVOID_HYST_MM DIST2_HYST_MM
-#endif
-#ifndef AVOID_CONFIRM_COUNT
 #define AVOID_CONFIRM_COUNT ABORT_CONFIRM_COUNT
-#endif
+#define DEMO_TIME_MS 30000U // time of the demo in ms
 
 static logVarId_t idAux0 = (logVarId_t)0xFFFF;
-static logVarId_t idDistance0 = (logVarId_t)0xFFFF;
+static logVarId_t idDistance0 = (logVarId_t)0xFFFF; // distance to the beacon
 static logVarId_t idZ = (logVarId_t)0xFFFF;
-// New: distance2
-static logVarId_t idDistance2 = (logVarId_t)0xFFFF;
+static logVarId_t idYaw = (logVarId_t)0xFFFF;
+static logVarId_t idDistance2 = (logVarId_t)0xFFFF; // distance to the other drone
 
 static uint8_t abortOverCount = 0;
-// New: counter for near-limit
-static uint8_t closeUnderCount __attribute__((unused)) = 0;
 // New: inner bound enter/exit confirmation
 static uint8_t innerOverCount = 0;
 static uint8_t innerUnderCount = 0;
 
 // Avoidance state
 static bool avoidActive = false;
-static uint32_t lastD2 __attribute__((unused)) = 0;
-static bool lastD2Valid __attribute__((unused)) = false;
 static uint8_t approachCount = 0;
 static uint8_t departCount = 0;
+
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
@@ -158,9 +70,14 @@ static inline void ensureLogId(logVarId_t* id, const char* group, const char* na
   }
 }
 
+// Normalize angle to (-180, 180] deg
+static inline float normalizeAngle(float a) {
+  while (a <= -180) a += 360;
+  while (a > 180) a -= 360;
+  return a;
+}
+
 static inline bool aux0ActiveLow(void) {
-  ensureLogId(&idAux0, "cppm", "aux0");
-  if (!logVarIdIsValid(idAux0)) return false;
   const int16_t v = logGetInt(idAux0);
   return (v > 0) && (v < AUX_ACTIVE_THRESH);
 }
@@ -185,33 +102,22 @@ static void sendHover(float vx, float vy, float z, float yawRateDeg) {
   commanderSetSetpoint(&sp, 3);
 }
 
-static inline float getZ(void) {
-  ensureLogId(&idZ, "stateEstimate", "z");
-  if (!logVarIdIsValid(idZ)) return -1.0f;
-  return logGetFloat(idZ);
-}
-
 static bool checkAndMaybeEmergencyLand(void) {
-  ensureLogId(&idDistance0, "ranging", "distance0");
-  ensureLogId(&idDistance2, "ranging", "distance2");
-
   bool trigger = false;
 
-  if (logVarIdIsValid(idDistance0)) {
-    const uint32_t d0 = logGetUint(idDistance0);
-    if (d0 > (DIST0_ABORT_MM + DIST0_HYST_MM)) {
-      if (abortOverCount < 0xFF) abortOverCount++;
-      if (abortOverCount >= ABORT_CONFIRM_COUNT) {
-        if (!seqAbort) {
-          DEBUG_PRINT("Emergency FAR: distance0=%lu mm (> %u+%u)\n",
-                      (unsigned long)d0, DIST0_ABORT_MM, DIST0_HYST_MM);
-        }
-        seqAbort = true;
-        trigger = true;
+  const uint32_t d0 = logGetUint(idDistance0);
+  if (d0 > (DIST0_ABORT_MM + DIST0_HYST_MM)) {
+    if (abortOverCount < 0xFF) abortOverCount++;
+    if (abortOverCount >= ABORT_CONFIRM_COUNT) {
+      if (!seqAbort) {
+        DEBUG_PRINT("Emergency FAR: distance0=%lu mm (> %u+%u)\n",
+                    (unsigned long)d0, DIST0_ABORT_MM, DIST0_HYST_MM);
       }
-    } else {
-      abortOverCount = 0;
+      seqAbort = true;
+      trigger = true;
     }
+  } else {
+    abortOverCount = 0;
   }
 
   // NOTE: distance2 no longer triggers emergency land; handled by avoidance mode
@@ -220,9 +126,6 @@ static bool checkAndMaybeEmergencyLand(void) {
 
 // Decide avoidance activation based on distance2 only (no derivative)
 static bool updateAvoidanceMode(void) {
-  ensureLogId(&idDistance2, "ranging", "distance2");
-  if (!logVarIdIsValid(idDistance2)) return false;
-
   const uint32_t d2 = logGetUint(idDistance2);
 
   // Immediate land if too close during avoidance
@@ -260,18 +163,17 @@ static bool updateAvoidanceMode(void) {
   return avoidActive;
 }
 
-static void landEmergency(void) {
+static void landToZero(void) {
   // Descend at constant vertical velocity until near ground
+  setpoint_t sp; memset(&sp, 0, sizeof(sp));
+  sp.mode.x = modeVelocity; sp.velocity.x = 0;
+  sp.mode.y = modeVelocity; sp.velocity.y = 0;
+  sp.mode.z = modeVelocity; sp.velocity.z = -LAND_VZ_MPS;
+  sp.mode.yaw = modeVelocity; sp.attitudeRate.yaw = 0;
+  sp.velocity_body = true;
   while (1) {
-    float z = getZ();
-    if (z >= 0.0f && z <= CUT_Z_M) break;
-
-    setpoint_t sp; memset(&sp, 0, sizeof(sp));
-    sp.mode.x = modeVelocity; sp.velocity.x = 0;
-    sp.mode.y = modeVelocity; sp.velocity.y = 0;
-    sp.mode.z = modeVelocity; sp.velocity.z = -LAND_VZ_MPS;
-    sp.mode.yaw = modeVelocity; sp.attitudeRate.yaw = 0;
-    sp.velocity_body = true;
+    float z = logGetFloat(idZ);
+    if (z >= 0.0f && z <= CUT_Z_M) break; // landing altitude reached
     commanderSetSetpoint(&sp, 3);
     vTaskDelay(pdMS_TO_TICKS(20));
   }
@@ -300,40 +202,6 @@ static void rampToHeight(float zTarget, uint32_t rampMs) {
   }
 }
 
-static void __attribute__((unused)) holdAtHeight(float z, uint32_t holdMs) {
-  const uint32_t dtMs = 20;
-  const uint32_t steps = holdMs / dtMs;
-  for (uint32_t i = 0; i < steps; i++) {
-    if (checkAndMaybeEmergencyLand()) return;
-    sendHover(0.0f, 0.0f, z, 0.0f);
-    vTaskDelay(pdMS_TO_TICKS(dtMs));
-  }
-}
-
-static void __attribute__((unused)) flyBodyVX(float vx, float z, uint32_t durationMs) {
-  const uint32_t dtMs = 20;
-  const uint32_t steps = durationMs / dtMs;
-  for (uint32_t i = 0; i < steps; i++) {
-    if (checkAndMaybeEmergencyLand()) return;
-    sendHover(vx, 0.0f, z, 0.0f);
-    vTaskDelay(pdMS_TO_TICKS(dtMs));
-  }
-}
-
-static void landToZero(uint32_t rampMs) {
-  const uint32_t dtMs = 20;
-  const uint32_t steps = (rampMs / dtMs) ? (rampMs / dtMs) : 1;
-  for (uint32_t i = 0; i <= steps; i++) {
-    const float z = TARGET_HEIGHT_M * (1.0f - (float)i / (float)steps);
-    sendHover(0.0f, 0.0f, z, 0.0f);
-    vTaskDelay(pdMS_TO_TICKS(dtMs));
-  }
-  for (int i = 0; i < 20; i++) {
-    sendHover(0.0f, 0.0f, 0.0f, 0.0f);
-    vTaskDelay(pdMS_TO_TICKS(10));
-  }
-}
-
 static void runSequence(void) {
   seqAbort = false;
   innerOverCount = innerUnderCount = 0;
@@ -346,23 +214,26 @@ static void runSequence(void) {
   float arcYawStart = 0.0f;
   float target_yaw = 0.0f;
 
-  DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d2<=%u, CW yaw; land if d0>=%u; stop after 2 routines\n",
+  uint32_t startTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+  DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d2<=%u, CW yaw; land if d0>=%u; stop after certain time\n",
               INNER_BOUND_MM, DIST2_AVOID_MM, DIST0_ABORT_MM);
 
   // Takeoff
   rampToHeight(TARGET_HEIGHT_M, RAMP_TIME_MS);
-  if (seqAbort) { landEmergency(); return; }
 
   enum { STRAIGHT = 0, TURN = 1 } mode = STRAIGHT;
   const uint32_t dtMs = 20;
 
-  while (!seqAbort && routines < 5) {
+  while (!seqAbort) {
+    if (( xTaskGetTickCount() * portTICK_PERIOD_MS - startTime) > DEMO_TIME_MS) {
+      break;
+    }
     // Emergency checks (outer bound)
     if (checkAndMaybeEmergencyLand()) break;
 
     // Read distance0
-    ensureLogId(&idDistance0, "ranging", "distance0");
-    const uint32_t d0 = logVarIdIsValid(idDistance0) ? logGetUint(idDistance0) : 0;
+    uint32_t d0 = logGetUint(idDistance0);
 
     // Clear arc cooldown once we re-enter the inner circle (with hysteresis)
     if (arcCooldown && d0 > 0 && d0 <= (INNER_BOUND_MM)) {
@@ -372,22 +243,22 @@ static void runSequence(void) {
 
     // Mode transitions with hysteresis + confirmation
     if (mode == STRAIGHT) {
-      if (d0 >= (INNER_BOUND_MM + INNER_HYST_MM)) {
+      if (d0 >= (INNER_BOUND_MM)) {
         if (!arcCooldown && (++innerOverCount >= ABORT_CONFIRM_COUNT)) {
           // Exiting inner radius: enter TURN and start heading tracking
           mode = TURN;
           innerOverCount = 0;
-          arcYawStart = getYawRad();
+          arcYawStart = logGetFloat(idYaw);
           target_yaw = normalizeAngle(arcYawStart - 90.0f); // 270 (-90) degrees from start
           arcActive = isfinite(arcYawStart);
-          DEBUG_PRINT("ENTER TURN (d0=%lu), arcActive=%d, startYaw=%.3f rad\n",
+          DEBUG_PRINT("ENTER TURN (d0=%lu), arcActive=%d, startYaw=%.3f deg\n",
                       (unsigned long)d0, arcActive ? 1 : 0, (double)arcYawStart);
         }
        } else {
          innerOverCount = 0;
        }
      } else { // TURN
-      if (d0 <= (INNER_BOUND_MM - INNER_HYST_MM)) {
+      if (d0 <= (INNER_BOUND_MM)) {
         if (++innerUnderCount >= ABORT_CONFIRM_COUNT) {
           mode = STRAIGHT;
           innerUnderCount = 0;
@@ -402,7 +273,7 @@ static void runSequence(void) {
     // While TURN is active, accumulate rotation relative to arcYawStart.
     // When 270° reached (in the configured yaw direction), stop yaw by switching to STRAIGHT.
     if (mode == TURN && arcActive) {
-      float curYaw = getYawRad();
+      float curYaw = logGetFloat(idYaw);
       if (isfinite(curYaw)) {
         const bool reached = (fabsf(curYaw - target_yaw) <= 3.0f) || (fabsf(curYaw - target_yaw - 360.0f) <= 3.0f);
         if (reached) {
@@ -436,11 +307,12 @@ static void runSequence(void) {
     vTaskDelay(pdMS_TO_TICKS(dtMs));
   }
 
+  landToZero();
   if (seqAbort) {
-    landEmergency();
+    DEBUG_PRINT("Emergency landing\n");
   } else {
-    landToZero(RAMP_TIME_MS);
-    DEBUG_PRINT("Done (routines=%u)\n", routines);
+    landToZero();
+    DEBUG_PRINT("Finished the demo in approx %u routines)\n", routines);
   }
 }
 
@@ -449,10 +321,17 @@ void appMain(void) {
               AUX_ACTIVE_THRESH, INNER_BOUND_MM, DIST0_ABORT_MM, DIST2_AVOID_MM);
 
   // Resolve required log IDs
-  while (!logVarIdIsValid(idAux0) || !logVarIdIsValid(idDistance0) || !logVarIdIsValid(idDistance2)) {
+  while (!logVarIdIsValid(idAux0) || 
+    !logVarIdIsValid(idYaw)       ||
+    !logVarIdIsValid(idDistance0) || 
+    !logVarIdIsValid(idDistance2) ||
+    !logVarIdIsValid(idZ) 
+  ) {
     ensureLogId(&idAux0,      "cppm",    "aux0");
+    ensureLogId(&idYaw, "stateEstimate", "yaw");
     ensureLogId(&idDistance0, "ranging", "distance0");
     ensureLogId(&idDistance2, "ranging", "distance2");
+    ensureLogId(&idZ, "stateEstimate", "z");
     vTaskDelay(pdMS_TO_TICKS(100));
   }
 
@@ -465,7 +344,7 @@ void appMain(void) {
     // Emergency always active, even when idle
     if (checkAndMaybeEmergencyLand()) {
       ledSet(LED_BLUE_L, false);
-      landEmergency();
+      landToZero();
       ledSet(LED_BLUE_L, true);
     }
 
