@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
+#include <math.h>
 
 #include "app.h"
 #include "FreeRTOS.h"
@@ -17,6 +18,25 @@
 #include "commander.h"
 #include "stabilizer_types.h"
 #include "supervisor.h"
+
+// Forward declaration so helpers can call ensureLogId() before its definition below
+static inline void ensureLogId(logVarId_t* id, const char* group, const char* name);
+
+// Normalize angle in degrees to (-180, 180]
+// This makes wrap-around checks simple across the 360->0 boundary.
+static inline float normalizeAngleDeg(float a) {
+  while (a <= -180.0f) a += 360.0f;
+  while (a >  180.0f)  a -= 360.0f;
+  return a;
+}
+
+// Yaw heading accessor (assumes stateEstimate.yaw is in degrees; adjust if needed)
+static logVarId_t idYaw = (logVarId_t)0xFFFF;
+static inline float getYawDeg(void) {
+  ensureLogId(&idYaw, "stateEstimate", "yaw");
+  if (!logVarIdIsValid(idYaw)) return NAN;
+  return logGetFloat(idYaw);
+}
 
 #ifndef TARGET_HEIGHT_M
 #define TARGET_HEIGHT_M 1.0f
@@ -330,6 +350,13 @@ static void runSequence(void) {
   seqAbort = false;
   innerOverCount = innerUnderCount = 0;
   uint8_t routines = 0;  // count of (exit inner bound -> re-enter) cycles
+  // Arc tracking/cooldown:
+  // - arcActive: we are tracking rotation since inner exit while in TURN
+  // - arcCooldown: once the 270° arc is completed, do not re-trigger TURN until inner is re-entered
+  bool arcActive = false;
+  bool arcCooldown = false;
+  float arcYawStart = 0.0f;
+  float targetYawDeg = 0.0f;
 
   DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d1<=%u, CCW yaw; land if d0>=%u; stop after 2 routines\n",
               INNER_BOUND_MM, DIST1_AVOID_MM, DIST0_ABORT_MM);
@@ -355,13 +382,25 @@ static void runSequence(void) {
     ensureLogId(&idDistance0, "ranging", "distance0");
     const uint32_t d0 = logVarIdIsValid(idDistance0) ? logGetUint(idDistance0) : 0;
 
-    // Mode transitions with hysteresis + confirmation
+    // Clear arc cooldown once we re-enter the inner circle (no hysteresis change here)
+    if (arcCooldown && d0 > 0 && d0 <= INNER_BOUND_MM) {
+      arcCooldown = false;
+      DEBUG_PRINT("ARC cooldown cleared by inner re-entry (d0=%lu)\n", (unsigned long)d0);
+    }
+
+    // Mode transitions with hysteresis + confirmation (unchanged switching logic)
     if (mode == STRAIGHT) {
       if (d0 >= (INNER_BOUND_MM + INNER_HYST_MM)) {
-        if (++innerOverCount >= ABORT_CONFIRM_COUNT) {
+        if (!arcCooldown && (++innerOverCount >= ABORT_CONFIRM_COUNT)) {
+          // Enter TURN: capture current heading and compute the 270° target
           mode = TURN;
           innerOverCount = 0;
-          DEBUG_PRINT("ENTER TURN (d0=%lu)\n", (unsigned long)d0);
+          arcYawStart = getYawDeg();
+          arcActive = isfinite(arcYawStart);
+          // 270° in the positive sense is equivalent to -90° relative target
+          targetYawDeg = normalizeAngleDeg(arcYawStart - 90.0f);
+          DEBUG_PRINT("ENTER TURN (d0=%lu), arcActive=%d, startYaw=%.1f deg, targetYaw=%.1f deg\n",
+                      (unsigned long)d0, arcActive ? 1 : 0, (double)arcYawStart, (double)targetYawDeg);
         }
       } else {
         innerOverCount = 0;
@@ -376,6 +415,30 @@ static void runSequence(void) {
         }
       } else {
         innerUnderCount = 0;
+      }
+    }
+
+    // While TURN is active, accumulate rotation relative to arcYawStart.
+    // Wrapping handled by normalizeAngleDeg; threshold 3° around target.
+    if (mode == TURN && arcActive) {
+      float curYaw = getYawDeg();
+      if (isfinite(curYaw)) {
+        // Error to target with wrap-around mapped to (-180, 180]
+        const float err = normalizeAngleDeg(curYaw - targetYawDeg);
+        const bool reached = fabsf(err) <= 3.0f ||
+                             fabsf(err - 360.0f) <= 3.0f; // extra guard if your yaw is unwrapped
+        if (reached) {
+          DEBUG_PRINT("TURN arc reached ~270° (err=%.2f deg) -> stop yaw, go STRAIGHT\n", (double)err);
+          // Stop yaw by switching to STRAIGHT; keep forward velocity
+          mode = STRAIGHT;
+          arcActive = false;
+          arcCooldown = true;  // prevent re-trigger until inner re-entry
+          innerUnderCount = 0; // avoid immediate flip-flop
+        }
+      } else {
+        // Lost yaw; stop arc tracking to avoid undefined behavior
+        arcActive = false;
+        DEBUG_PRINT("TURN arc: yaw unavailable, stopping arc tracking\n");
       }
     }
 
