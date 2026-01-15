@@ -41,6 +41,8 @@
 #define DIST2_AVOID_HYST_MM DIST2_HYST_MM
 #define AVOID_CONFIRM_COUNT ABORT_CONFIRM_COUNT
 #define DEMO_TIME_MS 30000U // time of the demo in ms
+#define DERIV_SAMPLE_INTERVAL_MS 50
+#define D0_BUFFER_SIZE 10
 
 static logVarId_t idAux0 = (logVarId_t)0xFFFF;
 static logVarId_t idDistance0 = (logVarId_t)0xFFFF; // distance to the beacon
@@ -58,6 +60,88 @@ static bool avoidActive = false;
 static uint8_t approachCount = 0;
 static uint8_t departCount = 0;
 
+// Derivative state
+typedef struct {
+  uint32_t samples[D0_BUFFER_SIZE];
+  uint8_t writeIndex;
+  uint8_t count;
+  uint32_t lastSampleTime;
+} D0Buffer;
+
+static D0Buffer d0Buffer;
+
+// Initialize the d0 buffer
+static void d0BufferReset(void) {
+  memset(&d0Buffer, 0, sizeof(d0Buffer));
+}
+
+// Add a sample to the buffer
+static void d0BufferAdd(uint32_t d0, uint32_t now) {
+  if ((now - d0Buffer.lastSampleTime) >= DERIV_SAMPLE_INTERVAL_MS) {
+    d0Buffer.samples[d0Buffer.writeIndex] = d0;
+    d0Buffer.writeIndex = (d0Buffer.writeIndex + 1) % D0_BUFFER_SIZE;
+    if (d0Buffer.count < D0_BUFFER_SIZE) {
+      d0Buffer.count++;
+    }
+    d0Buffer.lastSampleTime = now;
+  }
+}
+
+// Compute derivative using linear regression (least squares fit)
+// Returns derivative in mm/s, positive = moving away, negative = moving toward
+// Returns 0 if not enough samples
+static float d0BufferGetDerivative(void) {
+  if (d0Buffer.count < 2) {
+    // Need at least 2 samples
+    return 0.0f;
+  }
+  
+  // Use available samples (may be less than D0_BUFFER_SIZE during warmup)
+  uint8_t n = d0Buffer.count;
+  
+  // Linear regression: fit y = a + b*t to the data
+  // b = (n*sum(t*y) - sum(t)*sum(y)) / (n*sum(t^2) - (sum(t))^2)
+  // where t is time index (0, 1, 2, ..., n-1) and y is distance
+  
+  float sumT = 0.0f;
+  float sumY = 0.0f;
+  float sumTY = 0.0f;
+  float sumT2 = 0.0f;
+  
+  for (uint8_t i = 0; i < n; i++) {
+    // Get sample index in circular buffer (oldest to newest)
+    uint8_t idx;
+    if (d0Buffer.count < D0_BUFFER_SIZE) {
+      // Buffer not yet full, samples start at index 0
+      idx = i;
+    } else {
+      // Buffer full, oldest is at writeIndex
+      idx = (d0Buffer.writeIndex + i) % D0_BUFFER_SIZE;
+    }
+    
+    float t = (float)i;  // time index (in units of sample intervals)
+    float y = (float)d0Buffer.samples[idx];
+    
+    sumT += t;
+    sumY += y;
+    sumTY += t * y;
+    sumT2 += t * t;
+  }
+  
+  float denom = (float)n * sumT2 - sumT * sumT;
+  if (fabsf(denom) < 1e-6f) {
+    return 0.0f;  // Avoid division by zero
+  }
+  
+  // Slope in mm per sample interval
+  float slopePerInterval = ((float)n * sumTY - sumT * sumY) / denom;
+  
+  // Convert to mm/s
+  float intervalS = (float)DERIV_SAMPLE_INTERVAL_MS / 1000.0f;
+  float derivativeMmPerS = slopePerInterval / intervalS;
+  
+  return derivativeMmPerS;
+}
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
@@ -213,6 +297,8 @@ static void runSequence(void) {
   float arcYawStart = 0.0f;
   float target_yaw = 0.0f;
 
+  d0BufferReset();
+
   uint32_t startTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
   DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d2<=%u, CW yaw; land if d0>=%u; stop after certain time\n",
@@ -225,14 +311,25 @@ static void runSequence(void) {
   const uint32_t dtMs = 20;
 
   while (!seqAbort) {
-    if (( xTaskGetTickCount() * portTICK_PERIOD_MS - startTime) > DEMO_TIME_MS) {
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if ((now - startTime) > DEMO_TIME_MS) {
       break;
     }
+
+
+
     // Emergency checks (outer bound)
     if (checkAndMaybeEmergencyLand()) break;
 
     // Read distance0
     uint32_t d0 = logGetUint(idDistance0);
+
+    // add distance0 to the moving average window for derivative calculation
+    
+    d0BufferAdd(d0, now);
+    float d0Deriv = d0BufferGetDerivative();
+
+    DEBUG_PRINT("Current derivative: %.3f\n", (double)d0Deriv);
 
     // Clear arc cooldown once we re-enter the inner circle (with hysteresis)
     if (arcCooldown && d0 > 0 && d0 <= (INNER_BOUND_MM)) {
