@@ -22,7 +22,6 @@
 #define AUX_ACTIVE_THRESHOLD 0U
 #define TARGET_HEIGHT_M 1.0f
 #define FWD_SPEED_MPS 0.5f
-#define SEGMENT_TIME_MS 8000U
 #define RAMP_TIME_MS 1500U
 #define DIST0_ABORT_MM 4200U   // outer emergency bound (mm)
 #define DIST0_HYST_MM 100U          // hysteresis margin
@@ -358,7 +357,6 @@ static void runSequence(void) {
     uint32_t d0 = logGetUint(idDistance0);
 
     // add distance0 to the moving average window for derivative calculation
-    
     d0BufferAdd(d0, now);
     float d0Deriv = d0BufferGetDerivative();
 

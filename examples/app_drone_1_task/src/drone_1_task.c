@@ -20,7 +20,6 @@
 #define AUX_ACTIVE_THRESH 1400
 #define TARGET_HEIGHT_M 1.0f
 #define FWD_SPEED_MPS 0.5f
-#define SEGMENT_TIME_MS 8000U
 #define RAMP_TIME_MS 1500U
 #define DIST0_ABORT_MM 4200U   // outer emergency bound (mm)
 #define DIST0_HYST_MM 100U          // hysteresis margin
