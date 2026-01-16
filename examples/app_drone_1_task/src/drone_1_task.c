@@ -22,7 +22,7 @@
 #define FWD_SPEED_MPS 0.5f
 #define SEGMENT_TIME_MS 8000U
 #define RAMP_TIME_MS 1500U
-#define DIST0_ABORT_MM 3500U   // outer emergency bound (mm)
+#define DIST0_ABORT_MM 4200U   // outer emergency bound (mm)
 #define DIST0_HYST_MM 100U          // hysteresis margin
 #define INNER_BOUND_MM 1750U // Inner bound to start turning
 #define INNER_HYST_MM 100U
@@ -33,15 +33,15 @@
 #define DIST2_HYST_MM 100U
 #define ABORT_CONFIRM_COUNT 2 // Require N consecutive samples to trigger thresholds
 #define AVOID_ENTER_CONFIRM_COUNT 2
-#define AVOID_EXIT_CONFIRM_COUNT 10
-#define AVOID_MIN_LAND_MM 500U
+#define AVOID_EXIT_CONFIRM_COUNT 4
+#define AVOID_MIN_LAND_MM 600U
 #define AVOID_SPEED_FACTOR 1.0f      // full speed during avoidance
 #define AVOID_YAW_RATE_DPS 70.0f     // CW yaw rate for avoidance
 #define DIST2_AVOID_MM DIST2_CLOSE_MM
 #define DIST2_AVOID_HYST_MM DIST2_HYST_MM
 #define AVOID_CONFIRM_COUNT ABORT_CONFIRM_COUNT
-#define DEMO_TIME_MS 30000U // time of the demo in ms
-#define DERIV_SAMPLE_INTERVAL_MS 50
+#define DEMO_TIME_MS 60000U // time of the demo in ms
+#define DERIV_SAMPLE_INTERVAL_MS 20
 #define D0_BUFFER_SIZE 10
 
 static logVarId_t idAux0 = (logVarId_t)0xFFFF;
@@ -59,6 +59,7 @@ static uint8_t innerUnderCount = 0;
 static bool avoidActive = false;
 static uint8_t approachCount = 0;
 static uint8_t departCount = 0;
+bool avoidWasActive = false;
 
 // Derivative state
 typedef struct {
@@ -231,7 +232,7 @@ static bool updateAvoidanceMode(void) {
       approachCount = 0;
     }
   } else {
-    if (d2 >= (DIST2_AVOID_MM + DIST2_AVOID_HYST_MM)) {
+    if (d2 >= (DIST2_AVOID_MM)) {
       if (++departCount >= AVOID_EXIT_CONFIRM_COUNT) {
         avoidActive = false;
         departCount = 0;
@@ -307,7 +308,7 @@ static void runSequence(void) {
   // Takeoff
   rampToHeight(TARGET_HEIGHT_M, RAMP_TIME_MS);
 
-  enum { STRAIGHT = 0, TURN = 1 } mode = STRAIGHT;
+  enum { STRAIGHT = 0, TURN = 1, RECOVER = 2 } mode = STRAIGHT;
   const uint32_t dtMs = 20;
 
   while (!seqAbort) {
@@ -329,7 +330,7 @@ static void runSequence(void) {
     d0BufferAdd(d0, now);
     float d0Deriv = d0BufferGetDerivative();
 
-    DEBUG_PRINT("Current derivative: %.3f\n", (double)d0Deriv);
+    // DEBUG_PRINT("Current derivative: %.3f\n", (double)d0Deriv);
 
     // Clear arc cooldown once we re-enter the inner circle (with hysteresis)
     if (arcCooldown && d0 > 0 && d0 <= (INNER_BOUND_MM)) {
@@ -337,7 +338,7 @@ static void runSequence(void) {
       DEBUG_PRINT("ARC cooldown cleared by inner re-entry (d0=%lu)\n", (unsigned long)d0);
     }
 
-    // Mode transitions with hysteresis + confirmation
+    // Mode transitions + confirmation
     if (mode == STRAIGHT) {
       if (d0 >= (INNER_BOUND_MM)) {
         if (!arcCooldown && (++innerOverCount >= ABORT_CONFIRM_COUNT)) {
@@ -379,6 +380,10 @@ static void runSequence(void) {
           arcActive = false;
           arcCooldown = true;  // do not re-trigger TURN until inner is re-entered
           innerUnderCount = 0; // avoid instant STRAIGHT->TURN flip-flop
+          if (d0Deriv > 0) {
+            DEBUG_PRINT("However, derivative was %.2f so going into recovery mode\n", (double)d0Deriv);
+            mode = RECOVER;
+          }
         }
       } else {
         // Lost yaw; stop arc tracking to avoid undefined behavior
@@ -388,14 +393,33 @@ static void runSequence(void) {
     }
 
     // Avoidance overrides the normal command
+    avoidWasActive = avoidActive;
     const bool avoid = updateAvoidanceMode();
+
+    if ((avoidWasActive && !avoid) && (d0 >= INNER_BOUND_MM)){
+      mode = RECOVER;
+    }
+
     if (seqAbort) break;
     if (avoid) {
       sendHover(FWD_SPEED_MPS * AVOID_SPEED_FACTOR, 0.0f, TARGET_HEIGHT_M, AVOID_YAW_RATE_DPS); // CW
     } else if (mode == STRAIGHT) {
       // STRAIGHT: constant forward velocity, zero yaw
       sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, 0.0f);
-    } else {
+    } else if (mode == RECOVER) {
+      // RECOVER: proportionally steer towards a negative derivative with mdidle beacon
+      // desired yawrate = yawrate at zero / desired negative derivate * (abs(current deriv - target deriv))
+      // but also a small deadzone around the negative derivatives that at least brings us closer and reduces the chance of overshoot
+      float yawCommand = (50.0f/1400.0f) * fabsf(d0Deriv + 1400);
+      yawCommand = yawCommand > 30.0f ? yawCommand : 0.0f;
+      sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, yawCommand);
+      DEBUG_PRINT("Recovering with a yawrate of %.2f deg/s for a deriv of %.2f\n", (double)yawCommand, (double)d0Deriv);
+      if (d0 > 0 && d0 <= (INNER_BOUND_MM)) {
+        mode = STRAIGHT;
+        DEBUG_PRINT("Made it back to the circle!\n");
+      }
+    } else
+      {
       // TURN: constant forward velocity, configured yaw rate
       sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, TURN_YAW_RATE_DPS);
     }

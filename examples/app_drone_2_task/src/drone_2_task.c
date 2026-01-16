@@ -24,7 +24,7 @@
 #define FWD_SPEED_MPS 0.5f
 #define SEGMENT_TIME_MS 8000U
 #define RAMP_TIME_MS 1500U
-#define DIST0_ABORT_MM 3500U   // outer emergency bound (mm)
+#define DIST0_ABORT_MM 4200U   // outer emergency bound (mm)
 #define DIST0_HYST_MM 100U          // hysteresis margin
 #define INNER_BOUND_MM 1750U // Inner bound to start turning
 #define INNER_HYST_MM 100U
@@ -35,14 +35,17 @@
 #define DIST1_HYST_MM 100U
 #define ABORT_CONFIRM_COUNT 2 // Require N consecutive samples to trigger thresholds
 #define AVOID_ENTER_CONFIRM_COUNT 2
-#define AVOID_EXIT_CONFIRM_COUNT 10
+#define AVOID_EXIT_CONFIRM_COUNT 4
 #define AVOID_MIN_LAND_MM 500U
 #define AVOID_SPEED_FACTOR 1.0f      // full speed during avoidance
 #define AVOID_YAW_RATE_DPS -70.0f     // CCW yaw rate for avoidance
 #define DIST1_AVOID_MM DIST1_CLOSE_MM
 #define DIST1_AVOID_HYST_MM DIST1_HYST_MM
 #define AVOID_CONFIRM_COUNT ABORT_CONFIRM_COUNT
-#define DEMO_TIME_MS 30000U // time of the demo in ms
+#define DEMO_TIME_MS 60000U // time of the demo in ms
+#define DERIV_SAMPLE_INTERVAL_MS 20
+#define D0_BUFFER_SIZE 10
+
 
 
 static logVarId_t idRangingAux1 = (logVarId_t)0xFFFF;
@@ -61,9 +64,93 @@ static uint8_t innerUnderCount = 0;
 static bool avoidActive = false;
 static uint8_t approachCount = 0;
 static uint8_t departCount = 0;
+bool avoidWasActive = false;
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
+
+// Derivative state
+typedef struct {
+  uint32_t samples[D0_BUFFER_SIZE];
+  uint8_t writeIndex;
+  uint8_t count;
+  uint32_t lastSampleTime;
+} D0Buffer;
+
+static D0Buffer d0Buffer;
+
+// Initialize the d0 buffer
+static void d0BufferReset(void) {
+  memset(&d0Buffer, 0, sizeof(d0Buffer));
+}
+
+// Add a sample to the buffer
+static void d0BufferAdd(uint32_t d0, uint32_t now) {
+  if ((now - d0Buffer.lastSampleTime) >= DERIV_SAMPLE_INTERVAL_MS) {
+    d0Buffer.samples[d0Buffer.writeIndex] = d0;
+    d0Buffer.writeIndex = (d0Buffer.writeIndex + 1) % D0_BUFFER_SIZE;
+    if (d0Buffer.count < D0_BUFFER_SIZE) {
+      d0Buffer.count++;
+    }
+    d0Buffer.lastSampleTime = now;
+  }
+}
+
+// Compute derivative using linear regression (least squares fit)
+// Returns derivative in mm/s, positive = moving away, negative = moving toward
+// Returns 0 if not enough samples
+static float d0BufferGetDerivative(void) {
+  if (d0Buffer.count < 2) {
+    // Need at least 2 samples
+    return 0.0f;
+  }
+  
+  // Use available samples (may be less than D0_BUFFER_SIZE during warmup)
+  uint8_t n = d0Buffer.count;
+  
+  // Linear regression: fit y = a + b*t to the data
+  // b = (n*sum(t*y) - sum(t)*sum(y)) / (n*sum(t^2) - (sum(t))^2)
+  // where t is time index (0, 1, 2, ..., n-1) and y is distance
+  
+  float sumT = 0.0f;
+  float sumY = 0.0f;
+  float sumTY = 0.0f;
+  float sumT2 = 0.0f;
+  
+  for (uint8_t i = 0; i < n; i++) {
+    // Get sample index in circular buffer (oldest to newest)
+    uint8_t idx;
+    if (d0Buffer.count < D0_BUFFER_SIZE) {
+      // Buffer not yet full, samples start at index 0
+      idx = i;
+    } else {
+      // Buffer full, oldest is at writeIndex
+      idx = (d0Buffer.writeIndex + i) % D0_BUFFER_SIZE;
+    }
+    
+    float t = (float)i;  // time index (in units of sample intervals)
+    float y = (float)d0Buffer.samples[idx];
+    
+    sumT += t;
+    sumY += y;
+    sumTY += t * y;
+    sumT2 += t * t;
+  }
+  
+  float denom = (float)n * sumT2 - sumT * sumT;
+  if (fabsf(denom) < 1e-6f) {
+    return 0.0f;  // Avoid division by zero
+  }
+  
+  // Slope in mm per sample interval
+  float slopePerInterval = ((float)n * sumTY - sumT * sumY) / denom;
+  
+  // Convert to mm/s
+  float intervalS = (float)DERIV_SAMPLE_INTERVAL_MS / 1000.0f;
+  float derivativeMmPerS = slopePerInterval / intervalS;
+  
+  return derivativeMmPerS;
+}
 
 // Resolve a log var id if needed
 static inline void ensureLogId(logVarId_t* id, const char* group, const char* name) {
@@ -174,7 +261,7 @@ static bool updateAvoidanceMode(void) {
     }
   } else {
     // Strong exit: above threshold + hysteresis for many samples
-    if (d1 >= (DIST1_AVOID_MM + DIST1_AVOID_HYST_MM)) {
+    if (d1 >= (DIST1_AVOID_MM)) {
       if (++departCount >= AVOID_EXIT_CONFIRM_COUNT) {
         avoidActive = false;
         departCount = 0;
@@ -242,6 +329,8 @@ static void runSequence(void) {
   float arcYawStart = 0.0f;
   float target_yaw = 0.0f;
 
+  d0BufferReset();
+
   uint32_t startTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
   DEBUG_PRINT("Reactive: fwd, TURN if d0>=%u; AVOID if d1<=%u, CCW yaw; land if d0>=%u; stop after 2 routines\n",
@@ -253,20 +342,27 @@ static void runSequence(void) {
   // Takeoff
   rampToHeight(TARGET_HEIGHT_M, RAMP_TIME_MS);
 
-  enum { STRAIGHT = 0, TURN = 1 } mode = STRAIGHT;
+  enum { STRAIGHT = 0, TURN = 1, RECOVER = 2 } mode = STRAIGHT;
   const uint32_t dtMs = 20;
 
   while (!seqAbort) {
-    if (checkKillAndDisarm()) return;
-    if (( xTaskGetTickCount() * portTICK_PERIOD_MS - startTime) > DEMO_TIME_MS) {
+    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    if ((now - startTime) > DEMO_TIME_MS) {
       break;
     }
+
     // Emergency checks (outer bound)
     if (checkAndMaybeEmergencyLand()) break;
 
     // Read distance0
-    const uint32_t d0 = logGetUint(idDistance0);
+    uint32_t d0 = logGetUint(idDistance0);
 
+    // add distance0 to the moving average window for derivative calculation
+    
+    d0BufferAdd(d0, now);
+    float d0Deriv = d0BufferGetDerivative();
+
+    DEBUG_PRINT("Current derivative: %.3f\n", (double)d0Deriv);
     // Clear arc cooldown once we re-enter the inner circle (no hysteresis change here)
     if (arcCooldown && d0 > 0 && d0 <= INNER_BOUND_MM) {
       arcCooldown = false;
@@ -315,6 +411,10 @@ static void runSequence(void) {
           arcActive = false;
           arcCooldown = true;  // do not re-trigger TURN until inner is re-entered
           innerUnderCount = 0; // avoid instant STRAIGHT->TURN flip-flop
+          if (d0Deriv > 0) {
+            DEBUG_PRINT("However, derivative was %.2f so going into recovery mode\n", (double)d0Deriv);
+            mode = RECOVER;
+          }
         }
       } else {
         // Lost yaw; stop arc tracking to avoid undefined behavior
@@ -324,13 +424,32 @@ static void runSequence(void) {
     }
 
     // Avoidance overrides the normal command
+    avoidWasActive = avoidActive;
     const bool avoid = updateAvoidanceMode();
+
+    if ((avoidWasActive && !avoid) && (d0 >= INNER_BOUND_MM)){
+      mode = RECOVER;
+    }
+
     if (seqAbort) break;  // triggered by minimum distance during avoidance
     if (avoid) {
       sendHover(FWD_SPEED_MPS * AVOID_SPEED_FACTOR, 0.0f, TARGET_HEIGHT_M, AVOID_YAW_RATE_DPS);
     } else if (mode == STRAIGHT) {
       sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, 0.0f);
-    } else {
+    } else if (mode == RECOVER) {
+      // RECOVER: proportionally steer towards a negative derivative with mdidle beacon
+      // desired yawrate = yawrate at zero / desired negative derivate * (abs(current deriv - target deriv))
+      // but also a small deadzone around the negative derivatives that at least brings us closer and reduces the chance of overshoot
+      float yawCommand = (50.0f/1400.0f) * fabsf(d0Deriv + 1400);
+      yawCommand = yawCommand > 30.0f ? yawCommand : 0.0f;
+      sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, yawCommand);
+      DEBUG_PRINT("Recovering with a yawrate of %.2f deg/s for a deriv of %.2f\n", (double)yawCommand, (double)d0Deriv);
+      if (d0 > 0 && d0 <= (INNER_BOUND_MM)) {
+        mode = STRAIGHT;
+        DEBUG_PRINT("Made it back to the circle!\n");
+      }
+    } else
+      {
       sendHover(FWD_SPEED_MPS, 0.0f, TARGET_HEIGHT_M, TURN_YAW_RATE_DPS);
     }
 
