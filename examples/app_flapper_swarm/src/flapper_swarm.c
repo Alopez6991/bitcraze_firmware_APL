@@ -2,7 +2,7 @@
  * Unified Flapper Swarm App
  * 
  * This app supports multiple drones in a swarm with a single codebase.
- * The behavior is selected at runtime via the persistent parameter `swarm.droneId`:
+ * The drone ID is derived from the radio address (last nibble of URI):
  *   - droneId = 1: Primary drone, triggered by RC remote (cppm.aux0), avoids using distance2, CW yaw
  *   - droneId = 2: Secondary drone, triggered via UWB (ranging.aux1), avoids using distance1, CCW yaw
  * 
@@ -28,11 +28,12 @@
 #include "commander.h"
 #include "stabilizer_types.h"
 #include "supervisor.h"
+#include "configblock.h"
 
 // ============================================================================
-// Runtime-configurable drone ID (persistent parameter, set from client)
+// Drone ID (derived from radio address at startup)
 // ============================================================================
-static uint8_t droneId = 1;  // Default to drone 1
+static uint8_t droneId = 0;  // Will be set from radio address in appMain()
 
 // ============================================================================
 // Runtime-configurable flight parameters (can be changed from client)
@@ -59,7 +60,11 @@ static uint32_t demoTimeMs = 60000U;         // time of the demo in ms
 #define CUT_Z_M 0.05f               // cut controllers below this altitude
 #define DERIV_SAMPLE_INTERVAL_MS 20
 #define D0_BUFFER_SIZE 10
+#define DES_DERIV -1400.0f          // desired derivative wrt middle beacon
+#define RECOVER_YAWRATE 50.0f       // yawrate at 0 derivative
+#define RECOVER_DEADZONE 30.0f      // stop rotating within this target yawrate
 
+# 
 // Drone 1 specific: RC trigger threshold (active low)
 #define AUX_RC_ACTIVE_THRESH 1400
 // Drone 2+ specific: UWB trigger threshold (active high)
@@ -98,6 +103,8 @@ static bool avoidWasActive = false;
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
 
+// Recover variables
+static const float recoverFactor = - (DES_DERIV / RECOVER_YAWRATE);
 // ============================================================================
 // Derivative buffer for d0
 // ============================================================================
@@ -490,8 +497,8 @@ static void runSequence(void) {
     } else if (mode == STRAIGHT) {
       sendHover(fwdSpeedMps, 0.0f, targetHeightM, 0.0f);
     } else if (mode == RECOVER) {
-      float yawCommand = (50.0f / 1400.0f) * fabsf(d0Deriv + 1400);
-      yawCommand = yawCommand > 30.0f ? yawCommand : 0.0f;
+      float yawCommand = recoverFactor * fabsf(d0Deriv - DES_DERIV);
+      yawCommand = yawCommand > RECOVER_DEADZONE ? yawCommand : 0.0f;
       sendHover(fwdSpeedMps, 0.0f, targetHeightM, yawCommand);
       DEBUG_PRINT("Recovering with yawrate %.2f deg/s for deriv %.2f\n", (double)yawCommand, (double)d0Deriv);
       if (d0 > 0 && d0 <= innerBoundMm) {
@@ -518,7 +525,9 @@ static void runSequence(void) {
 // App entry point
 // ============================================================================
 void appMain(void) {
-  DEBUG_PRINT("Flapper Swarm App started, droneId=%u\n", droneId);
+  // Get drone ID from radio address (last nibble, like lpsTwrTag does)
+  droneId = (uint8_t)(configblockGetRadioAddress() & 0xF);
+  DEBUG_PRINT("Flapper Swarm App started, droneId=%u (from radio address)\n", droneId);
 
   // Resolve log IDs based on droneId
   // Common IDs for all drones
@@ -575,7 +584,6 @@ void appMain(void) {
 // Parameter definitions (can be changed from client)
 // ============================================================================
 PARAM_GROUP_START(swarm)
-  PARAM_ADD(PARAM_UINT8 | PARAM_PERSISTENT, droneId, &droneId)
   PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, targetHeight, &targetHeightM)
   PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, fwdSpeed, &fwdSpeedMps)
   PARAM_ADD(PARAM_UINT16 | PARAM_PERSISTENT, dist0Abort, &dist0AbortMm)

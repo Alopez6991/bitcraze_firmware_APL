@@ -4,7 +4,11 @@ This folder contains a unified swarm application that supports multiple drones w
 
 ## Overview
 
-The app supports different drone roles selected at runtime via the persistent parameter `swarm.droneId`:
+The drone ID is automatically derived from the **last nibble of the radio address** (same as `lpsTwrTag` uses for ranging). This ensures consistency between the app behavior and the UWB ranging ID.
+
+For example:
+- Radio address `0xE7E7E7E7E1` → droneId = 1
+- Radio address `0xE7E7E7E7E2` → droneId = 2
 
 | droneId | Role | Trigger | Avoidance Distance | Avoidance Yaw |
 |---------|------|---------|-------------------|---------------|
@@ -19,20 +23,23 @@ The app supports different drone roles selected at runtime via the persistent pa
 
 ## Configuration
 
-Set the drone ID from the Python client before flight:
+The drone ID is set automatically from the radio address. To configure a Crazyflie's address, use:
 
-```python
-import cflib.crtp
-from cflib.crazyflie import Crazyflie
-
-cf = Crazyflie()
-cf.open_link('radio://0/80/2M')
-
-# Set drone ID (persisted across reboots)
-cf.param.set_value('swarm.droneId', 1)  # or 2
+```bash
+# Set radio address (last digit determines droneId)
+cfclient --address 0xE7E7E7E7E1  # droneId = 1
+cfclient --address 0xE7E7E7E7E2  # droneId = 2
 ```
 
-The parameter is persistent, so it survives power cycles after being set once.
+Or use the Crazyflie client to configure the address in EEPROM.
+
+Flight parameters can be tuned at runtime:
+
+```python
+cf.param.set_value('swarm.targetHeight', 1.2)
+cf.param.set_value('swarm.fwdSpeed', 0.6)
+cf.param.set_value('swarm.demoTime', 90000)  # 90 seconds
+```
 
 ## Building
 
