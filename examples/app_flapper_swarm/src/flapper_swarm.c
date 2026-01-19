@@ -25,6 +25,7 @@
 
 #include "log.h"
 #include "param.h"
+#include "param_logic.h"
 #include "commander.h"
 #include "stabilizer_types.h"
 #include "supervisor.h"
@@ -104,7 +105,7 @@ static bool avoidWasActive = false;
 static volatile bool seqAbort = false;
 
 // Recover variables
-static const float recoverFactor = - (DES_DERIV / RECOVER_YAWRATE);
+static const float recoverFactor = - ( RECOVER_YAWRATE / DES_DERIV);
 // ============================================================================
 // Derivative buffer for d0
 // ============================================================================
@@ -522,6 +523,50 @@ static void runSequence(void) {
 }
 
 // ============================================================================
+// Velocity Controller Gains Configuration
+// ============================================================================
+static void setVelocityControllerGains(void) {
+  // We set the gains to ensure they are consistent, even if a flapper has different gains stored in memory.
+  // X velocity gains
+  paramVarId_t vxKpId = paramGetVarId("velCtlPid", "vxKp");
+  paramVarId_t vxKiId = paramGetVarId("velCtlPid", "vxKi");
+  paramVarId_t vxKdId = paramGetVarId("velCtlPid", "vxKd");
+  paramVarId_t vxKFFId = paramGetVarId("velCtlPid", "vxKFF");
+
+  // Y velocity gains
+  paramVarId_t vyKpId = paramGetVarId("velCtlPid", "vyKp");
+  paramVarId_t vyKiId = paramGetVarId("velCtlPid", "vyKi");
+  paramVarId_t vyKdId = paramGetVarId("velCtlPid", "vyKd");
+  paramVarId_t vyKFFId = paramGetVarId("velCtlPid", "vyKFF");
+
+  // Z velocity gains
+  paramVarId_t vzKpId = paramGetVarId("velCtlPid", "vzKp");
+  paramVarId_t vzKiId = paramGetVarId("velCtlPid", "vzKi");
+  paramVarId_t vzKdId = paramGetVarId("velCtlPid", "vzKd");
+  paramVarId_t vzKFFId = paramGetVarId("velCtlPid", "vzKFF");
+
+  // Set X velocity gains
+  if (PARAM_VARID_IS_VALID(vxKFFId)) paramSetFloat(vxKFFId, 30.0f);
+  if (PARAM_VARID_IS_VALID(vxKdId)) paramSetFloat(vxKdId, 0.0f);
+  if (PARAM_VARID_IS_VALID(vxKiId)) paramSetFloat(vxKiId, 5.0f);
+  if (PARAM_VARID_IS_VALID(vxKpId)) paramSetFloat(vxKpId, 20.0f);
+
+  // Set Y velocity gains
+  if (PARAM_VARID_IS_VALID(vyKFFId)) paramSetFloat(vyKFFId, 8.0f);
+  if (PARAM_VARID_IS_VALID(vyKdId)) paramSetFloat(vyKdId, 0.0f);
+  if (PARAM_VARID_IS_VALID(vyKiId)) paramSetFloat(vyKiId, 5.0f);
+  if (PARAM_VARID_IS_VALID(vyKpId)) paramSetFloat(vyKpId, 12.0f);
+
+  // Set Z velocity gains
+  if (PARAM_VARID_IS_VALID(vzKFFId)) paramSetFloat(vzKFFId, 0.0f);
+  if (PARAM_VARID_IS_VALID(vzKdId)) paramSetFloat(vzKdId, 0.0f);
+  if (PARAM_VARID_IS_VALID(vzKiId)) paramSetFloat(vzKiId, 0.5f);
+  if (PARAM_VARID_IS_VALID(vzKpId)) paramSetFloat(vzKpId, 20.0f);
+
+  DEBUG_PRINT("Velocity controller gains set\n");
+}
+
+// ============================================================================
 // App entry point
 // ============================================================================
 void appMain(void) {
@@ -529,6 +574,7 @@ void appMain(void) {
   droneId = (uint8_t)(configblockGetRadioAddress() & 0xF);
   DEBUG_PRINT("Flapper Swarm App started, droneId=%u (from radio address)\n", droneId);
 
+  
   // Resolve log IDs based on droneId
   // Common IDs for all drones
   while (!logVarIdIsValid(idDistance0) || !logVarIdIsValid(idZ) || !logVarIdIsValid(idYaw)) {
@@ -537,7 +583,7 @@ void appMain(void) {
     ensureLogId(&idYaw,       "stateEstimate", "yaw");
     vTaskDelay(pdMS_TO_TICKS(100));
   }
-
+  
   // Drone-specific IDs
   if (droneId == 1) {
     // Drone 1: RC trigger and distance to drone 2
@@ -547,34 +593,36 @@ void appMain(void) {
       vTaskDelay(pdMS_TO_TICKS(100));
     }
     DEBUG_PRINT("Drone 1: RC trigger (cppm.aux0<%d), avoid on distance2<=%u (CW)\n",
-                AUX_RC_ACTIVE_THRESH, peerCloseMm);
-  } else {
-    // Drone 2+: UWB trigger/kill and distance to drone 1
-    while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idRangingAux2) ||
-           !logVarIdIsValid(idDistance1)) {
-      ensureLogId(&idRangingAux1, "ranging", "aux1");
-      ensureLogId(&idRangingAux2, "ranging", "aux2");
-      ensureLogId(&idDistance1,   "ranging", "distance1");
-      vTaskDelay(pdMS_TO_TICKS(100));
-    }
-    DEBUG_PRINT("Drone %u: UWB trigger (ranging.aux1>%u), kill (ranging.aux2), avoid on distance1<=%u (CCW)\n",
-                droneId, AUX_UWB_ACTIVE_THRESHOLD, peerCloseMm);
-  }
-
-  bool wasActive = false;
-  while (1) {
-    const bool active = isTriggerActive();
+      AUX_RC_ACTIVE_THRESH, peerCloseMm);
+    } else {
+      // Drone 2+: UWB trigger/kill and distance to drone 1
+      while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idRangingAux2) ||
+      !logVarIdIsValid(idDistance1)) {
+        ensureLogId(&idRangingAux1, "ranging", "aux1");
+        ensureLogId(&idRangingAux2, "ranging", "aux2");
+        ensureLogId(&idDistance1,   "ranging", "distance1");
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
+      DEBUG_PRINT("Drone %u: UWB trigger (ranging.aux1>%u), kill (ranging.aux2), avoid on distance1<=%u (CCW)\n",
+        droneId, AUX_UWB_ACTIVE_THRESHOLD, peerCloseMm);
+      }
+      
+      bool wasActive = false;
+      while (1) {
+        const bool active = isTriggerActive();
 
     // Emergency always active, even when idle
     if (checkAndMaybeEmergencyLand()) {
       landToZero();
     }
-
+    
     // On rising edge of trigger, run the sequence
     if (active && !wasActive) {
+      // Set velocity controller gains to ensure consistent behavior
+      setVelocityControllerGains();
       runSequence();
     }
-
+    
     wasActive = active;
     vTaskDelay(pdMS_TO_TICKS(20));
   }

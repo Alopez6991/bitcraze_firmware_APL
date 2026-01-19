@@ -84,7 +84,7 @@ static locoAddress_t selfAddress;
 #define MAX_SWARM_SIZE (LOCODECK_NR_OF_TWR_ANCHORS + 1)
 
 // Swarm size: total number of crazyflies in the swarm (including self)
-static uint8_t swarmSize = MAX_SWARM_SIZE;
+static uint8_t swarmSize = 3;
 
 // Only this drone ID is allowed to publish AUX (default: 1)
 static uint8_t auxPublisherId = 1;
