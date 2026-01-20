@@ -26,6 +26,11 @@ class FlightState(Enum):
     AVOID = 2
     RECOVER = 3
 
+class LandingReason(Enum):
+        """Reason for emergency landing."""
+        NONE = auto()
+        OUT_OF_BOUNDS = auto()
+        COLLISION = auto()
 
 @dataclass
 class ControlCommand:
@@ -167,9 +172,7 @@ class SwarmController:
         self.inner_under_count = 0
         self.approach_count = 0
         self.depart_count = 0
-        
-        # Emergency flag
-        self.seq_abort = False
+
         
         # Derivative estimator for beacon distance
         self.d0_deriv = DerivativeEstimator(
@@ -195,7 +198,6 @@ class SwarmController:
         self.inner_under_count = 0
         self.approach_count = 0
         self.depart_count = 0
-        self.seq_abort = False
         self.d0_deriv.reset()
         self.peer_dist_deriv.reset()
         
@@ -234,9 +236,9 @@ class SwarmController:
         self.ctx.peer_dist_deriv = self.peer_dist_deriv.get_derivative()
         
         # Check emergency conditions
-        should_land = self._check_emergency(d0, peer_dist)
-        if should_land:
-            return ControlCommand(), True
+        emergency_reason = self._check_emergency(d0, peer_dist)
+        if emergency_reason != LandingReason.NONE:
+            return ControlCommand(), emergency_reason
         
         # Clear arc cooldown once we re-enter the inner circle
         if self.ctx.arc_cooldown and d0 > 0 and d0 <= p.inner_bound_m:
@@ -250,19 +252,15 @@ class SwarmController:
             self.current_state = next_state
             self._on_enter_state(self.current_state, current_yaw)
         
-        if self.seq_abort:
-            return ControlCommand(), True
-        
         # Execute current state
         cmd = self._execute_state(self.current_state)
         
-        return cmd, False
+        return cmd, emergency_reason
     
     # =========================================================================
     # Emergency checks
     # =========================================================================
-    
-    def _check_emergency(self, d0: float, peer_dist: float) -> bool:
+    def _check_emergency(self, d0: float, peer_dist: float) -> LandingReason:
         """
         Check emergency conditions (matching C firmware).
         
@@ -275,18 +273,16 @@ class SwarmController:
         if d0 > p.dist0_abort_m:
             self.abort_over_count += 1
             if self.abort_over_count >= p.abort_confirm_count:
-                self.seq_abort = True
-                return True
+                return LandingReason.OUT_OF_BOUNDS
         else:
             self.abort_over_count = 0
         
         # Check peer collision during AVOID state
         if (self.current_state == FlightState.AVOID and 
             peer_dist > 0 and peer_dist <= p.avoid_min_land_m):
-            self.seq_abort = True
-            return True
+            return LandingReason.COLLISION
         
-        return False
+        return LandingReason.NONE
     
     # =========================================================================
     # Avoidance confirmation logic (matching C firmware)
@@ -347,7 +343,6 @@ class SwarmController:
     def _on_enter_recover(self) -> None:
         """Enter RECOVER state."""
         # If the distance to central beacon is larger than max distance - turning radius, we should keep the direction
-        print(f"d0: {self.ctx.d0}, bound: {self.params.dist0_abort_m - 0.8}")
         if (self.ctx.d0 < self.params.dist0_abort_m - 0.8):
             self.ctx.target_dir = 1
     

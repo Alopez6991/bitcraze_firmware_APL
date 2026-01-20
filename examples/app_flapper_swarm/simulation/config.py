@@ -196,17 +196,17 @@ default_config = Config(
     # FLIGHT PARAMETERS
     # -------------------------------------------------------------------------
     flight=FlightParams(
-        fwd_speed_mps=0.5,
+        fwd_speed_mps=0.4,
         dist0_abort_m=3.0,
-        inner_bound_m=1.5,
-        turn_yaw_rate_dps=40.0,
+        inner_bound_m=1.2,
+        turn_yaw_rate_dps=60.0,
         peer_close_m=2.0,
         avoid_min_land_m=0.5,
-        avoid_speed_factor=1.0,
+        avoid_speed_factor=0.8,
         avoid_yaw_rate_dps=70.0,
-        abort_confirm_count=2,
-        avoid_enter_confirm_count=2,
-        avoid_exit_confirm_count=4,
+        abort_confirm_count=1,
+        avoid_enter_confirm_count=1,
+        avoid_exit_confirm_count=1,
         des_deriv_mps=-1.4,
         recover_yaw_rate_dps=50.0,
         recover_deadzone_dps=30.0,
@@ -238,14 +238,14 @@ default_config = Config(
     # -------------------------------------------------------------------------
     drone1=DroneConfig(
         initial=DroneInitialState(
-            x=0.8,
-            y=0.0,
+            x=1.2842,
+            y=-1.4800,
             z=1.0,  # Flying altitude (meters)
-            yaw=270.0,
+            yaw=-20.9322,
         ),
         noise=DroneNoiseParams(
-            enable_process_noise=True,
-            enable_sensor_noise=True,
+            enable_process_noise=False,
+            enable_sensor_noise=False,
             # Process noise
             process_vx_std=0.02,
             process_vy_std=0.05,
@@ -262,14 +262,14 @@ default_config = Config(
     # -------------------------------------------------------------------------
     drone2=DroneConfig(
         initial=DroneInitialState(
-            x=-1.0,
-            y=0.0,
+            x=-0.5853,
+            y=0.1837,
             z=1.0,  # Flying altitude (meters)
-            yaw=270.0,
+            yaw=2.2283,
         ),
         noise=DroneNoiseParams(
-            enable_process_noise=True,
-            enable_sensor_noise=True,
+            enable_process_noise=False,
+            enable_sensor_noise=False,
             # Process noise
             process_vx_std=0.02,
             process_vy_std=0.05,

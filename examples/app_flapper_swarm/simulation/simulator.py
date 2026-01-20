@@ -6,17 +6,72 @@ and provides a visual simulation using Pygame.
 """
 import math
 import sys
+from dataclasses import dataclass
+from enum import Enum, auto
 from typing import List, Tuple, Optional
-
-try:
-    import pygame
-except ImportError:
-    print("Pygame is required. Install with: pip install pygame")
-    sys.exit(1)
 
 from .config import Config, default_config, DroneConfig
 from .drone import Drone, DroneState, NoisyKinematicPhysics, KinematicPhysics, UWBSensor
-from .controller import SwarmController, FlightMode
+from .controller import SwarmController, FlightMode, LandingReason
+
+
+# =============================================================================
+# SIMULATION RESULT TYPES (for headless/Monte Carlo mode)
+# =============================================================================
+
+class TerminationReason(Enum):
+    """Reason why a simulation ended."""
+    SUCCESS = auto()              # Both drones completed full demo time
+    PARTIAL_SUCCESS = auto()
+    OUT_OF_BOUNDS = auto()        # At least one drone exceeded outer boundary
+    COLLISION = auto()            # Drones got too close to each other
+    UNKNOWN = auto()              # Unknown/unexpected termination
+
+
+@dataclass
+class InitialState:
+    """Initial state of a drone."""
+    x: float
+    y: float
+    z: float
+    yaw: float
+
+
+@dataclass
+class SimulationResult:
+    """Result of a single simulation run."""
+    termination_reason: TerminationReason
+    time_elapsed: float           # How long the simulation ran (seconds)
+    min_peer_distance: float      # Minimum distance between drones (meters)
+    avoidance_events: int         # Number of times avoidance was triggered
+    drone1_landed_early: bool     # Whether drone 1 landed before demo time
+    drone2_landed_early: bool     # Whether drone 2 landed before demo time
+    drone1_initial: InitialState = None  # Initial state of drone 1
+    drone2_initial: InitialState = None  # Initial state of drone 2
+    
+    @property
+    def success(self) -> bool:
+        """True if simulation completed fully successfully."""
+        return self.termination_reason == TerminationReason.SUCCESS
+    
+    @property
+    def partial_succes(self) -> bool:
+        return self.termination_reason == TerminationReason.PARTIAL_SUCCESS
+    
+    @property
+    def failed_out_of_bounds(self) -> bool:
+        """True if simulation failed due to out of bounds."""
+        return self.termination_reason == TerminationReason.OUT_OF_BOUNDS
+    
+    @property
+    def failed_collision(self) -> bool:
+        """True if simulation failed due to collision."""
+        return self.termination_reason == TerminationReason.COLLISION
+    
+    @property
+    def any_failure(self) -> bool:
+        """True if there was any problem (including partial success)."""
+        return self.termination_reason != TerminationReason.SUCCESS
 
 
 class Simulator:
@@ -25,26 +80,48 @@ class Simulator:
     
     Handles the simulation loop, visualization, and coordination
     between drones and their controllers.
+    
+    Can run in two modes:
+    - Visual mode (default): Uses Pygame for visualization
+    - Headless mode: No visualization, faster, returns results
     """
     
-    def __init__(self, config: Config = None):
+    def __init__(self, config: Config = None, headless: bool = False):
         """
         Initialize the simulator.
         
         Args:
             config: Configuration object (uses default if not provided)
+            headless: If True, run without visualization (for Monte Carlo)
         """
         self.config = config or default_config
         self.running = False
         self.paused = False
         self.time = 0.0
+        self.headless = headless
         
-        # Initialize pygame
-        pygame.init()
-        pygame.display.set_caption("Flapper Swarm Simulation")
-        self.screen = pygame.display.set_mode(self.config.viz.window_size)
-        self.clock = pygame.time.Clock()
-        self.font = pygame.font.Font(None, 24)
+        # Termination tracking (for headless mode)
+        self._termination_reason = TerminationReason.UNKNOWN
+        
+        # Initialize pygame only if not headless
+        if not headless:
+            try:
+                import pygame
+                self._pygame = pygame
+            except ImportError:
+                print("Pygame is required for visual mode. Install with: pip install pygame")
+                sys.exit(1)
+            
+            self._pygame.init()
+            self._pygame.display.set_caption("Flapper Swarm Simulation")
+            self.screen = self._pygame.display.set_mode(self.config.viz.window_size)
+            self.clock = self._pygame.time.Clock()
+            self.font = self._pygame.font.Font(None, 24)
+        else:
+            self._pygame = None
+            self.screen = None
+            self.clock = None
+            self.font = None
         
         # Create per-drone UWB sensor models
         self.uwb_sensors: List[UWBSensor] = []
@@ -117,6 +194,10 @@ class Simulator:
         self.min_peer_distance = float('inf')
         self.avoidance_events = 0
         
+        # Track early landings and reasons for headless mode
+        self._early_landing_times = [None, None]  # When each drone landed early (None if didn't)
+        self._early_landing_reasons = [None, None]  # 'collision' or 'out_of_bounds'
+        
         # Reinitialize drones with fresh physics models
         self._init_drones()
         
@@ -125,7 +206,10 @@ class Simulator:
             ctrl.reset()
     
     def run(self) -> None:
-        """Run the simulation loop."""
+        """Run the simulation loop with visualization."""
+        if self.headless:
+            raise RuntimeError("Cannot run visual mode in headless simulator. Use run_headless() instead.")
+        
         self.running = True
         self.reset()
         
@@ -142,10 +226,60 @@ class Simulator:
             self._render()
             self.clock.tick(self.config.viz.fps)
         
-        pygame.quit()
+        self._pygame.quit()
+    
+    def run_headless(self) -> SimulationResult:
+        """
+        Run the simulation without visualization.
+        
+        Returns:
+            SimulationResult with termination reason and statistics
+        """
+        self.running = True
+        self.reset()
+        self._termination_reason = TerminationReason.UNKNOWN
+        
+        # Capture initial states before simulation starts
+        drone1_init = InitialState(
+            x=self.config.drone1.initial.x,
+            y=self.config.drone1.initial.y,
+            z=self.config.drone1.initial.z,
+            yaw=self.config.drone1.initial.yaw,
+        )
+        drone2_init = InitialState(
+            x=self.config.drone2.initial.x,
+            y=self.config.drone2.initial.y,
+            z=self.config.drone2.initial.z,
+            yaw=self.config.drone2.initial.yaw,
+        )
+        
+        # Start drones
+        for drone in self.drones:
+            drone.takeoff()
+        
+        # Run until termination
+        while self.running:
+            self._update_headless()
+        
+        # Determine if drones landed early
+        demo_time = self.config.flight.demo_time_s
+        drone1_early = not self.drones[0].is_flying
+        drone2_early = not self.drones[1].is_flying
+        
+        return SimulationResult(
+            termination_reason=self._termination_reason,
+            time_elapsed=self.time,
+            min_peer_distance=self.min_peer_distance,
+            avoidance_events=self.avoidance_events,
+            drone1_landed_early=drone1_early,
+            drone2_landed_early=drone2_early,
+            drone1_initial=drone1_init,
+            drone2_initial=drone2_init,
+        )
     
     def _handle_events(self) -> None:
         """Handle pygame events."""
+        pygame = self._pygame
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
@@ -185,23 +319,101 @@ class Simulator:
             # Calculate TRUE distances (for statistics)
             true_d0 = drone.distance_to(*beacon)
             true_peer_dist = drone.distance_to_drone(other_drone)
-            
             # Track minimum TRUE peer distance (for collision detection stats)
             self.min_peer_distance = min(self.min_peer_distance, true_peer_dist)
-            
             # Get MEASURED distances (with per-drone sensor noise for controller)
             measured_d0 = uwb.measure(true_d0)
-            measured_peer_dist = uwb.measure(true_peer_dist)
+            measured_peer_dist = uwb.measure(true_peer_dist) #if true_peer_dist != float('inf') else float('inf')
             
             # Get control command using MEASURED (noisy) distances
-            cmd, should_land = ctrl.update(
+            cmd, emergency_reason = ctrl.update(
                 d0=measured_d0,
                 peer_dist=measured_peer_dist,
                 current_yaw=drone.yaw,
                 time=self.time
             )
             
-            if should_land:
+            if emergency_reason != LandingReason.NONE:
+                drone.land()
+                continue
+            
+            # Apply command to drone
+            drone.update(cmd.vx_body, cmd.vy_body, cmd.yaw_rate, dt)
+        
+        # Count avoidance events
+        for i, ctrl in enumerate(self.controllers):
+            if ctrl.is_avoiding and not prev_avoiding[i]:
+                self.avoidance_events += 1
+        
+        self.time += dt
+    
+    def _update_headless(self) -> None:
+        """Update simulation state in headless mode (with termination detection)."""
+        dt = self.config.sim.dt
+        beacon = self.config.beacon_pos
+        flight = self.config.flight
+        
+        # Check if demo time exceeded -> SUCCESS
+        if self.time >= flight.demo_time_s:
+            
+            # Check if any drone landed early (partial success)
+            if any(t is not None for t in self._early_landing_times):
+                # Determine termination reason from the recorded landing reasons
+                if any(r == LandingReason.COLLISION for r in self._early_landing_reasons if r):
+                    self._termination_reason = TerminationReason.COLLISION
+                elif any(r == LandingReason.OUT_OF_BOUNDS for r in self._early_landing_reasons if r):
+                    self._termination_reason = TerminationReason.OUT_OF_BOUNDS
+                else:
+                    self._termination_reason = TerminationReason.PARTIAL_SUCCESS
+            else:
+                self._termination_reason = TerminationReason.SUCCESS
+            self.running = False
+            return
+        
+        # Check if all drones have landed (premature termination)
+        if not any(drone.is_flying for drone in self.drones):
+            # Determine why based on the recorded early landing reasons
+            if any(r == LandingReason.OUT_OF_BOUNDS for r in self._early_landing_reasons if r):
+                self._termination_reason = TerminationReason.OUT_OF_BOUNDS
+            else:
+                self._termination_reason = TerminationReason.COLLISION
+            self.running = False
+            return
+        
+        # Track avoidance state changes
+        prev_avoiding = [ctrl.is_avoiding for ctrl in self.controllers]
+        
+        # Update each drone
+        for i, (drone, ctrl, uwb) in enumerate(zip(self.drones, self.controllers, self.uwb_sensors)):
+            if not drone.is_flying:
+                continue
+            
+            # Get other drone for peer distance
+            other_drone = self.drones[1 - i]
+            
+            # Calculate TRUE distances (for statistics)
+            true_d0 = drone.distance_to(*beacon)
+            true_peer_dist = drone.distance_to_drone(other_drone)
+            # Track minimum TRUE peer distance (for collision detection stats)
+            self.min_peer_distance = min(self.min_peer_distance, true_peer_dist)
+
+            # Get MEASURED distances (with per-drone sensor noise for controller)
+            measured_d0 = uwb.measure(true_d0)
+            measured_peer_dist = uwb.measure(true_peer_dist) if true_peer_dist != float('inf') else float('inf')
+            
+            # Get control command using MEASURED (noisy) distances
+            cmd, emergency_reason = ctrl.update(
+                d0=measured_d0,
+                peer_dist=measured_peer_dist,
+                current_yaw=drone.yaw,
+                time=self.time
+            )
+            
+            if emergency_reason != LandingReason.NONE:
+                # print(f"drone: {i}, dist: {true_peer_dist:.2f},  min_dist: {self.min_peer_distance:.2f}, reason: {emergency_reason}")
+                # Record early landing info
+                self._early_landing_times[i] = self.time
+                self._early_landing_reasons[i] = emergency_reason
                 drone.land()
                 continue
             
@@ -228,6 +440,7 @@ class Simulator:
     
     def _render(self) -> None:
         """Render the simulation."""
+        pygame = self._pygame
         viz = self.config.viz
         flight = self.config.flight
         

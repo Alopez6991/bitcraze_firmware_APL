@@ -21,8 +21,9 @@ from .drone import (
     NoisyKinematicPhysics,
     UWBSensor
 )
-from .controller import SwarmController, FlightMode, FlightState, ControlCommand
-from .simulator import Simulator, run_simulation
+from .controller import SwarmController, FlightMode, LandingReason, FlightState, ControlCommand
+from .simulator import Simulator, run_simulation, SimulationResult, TerminationReason, InitialState
+from .monte_carlo import MonteCarloRunner, MonteCarloStats, run_monte_carlo
 
 __all__ = [
     'Config',
@@ -42,7 +43,14 @@ __all__ = [
     'SwarmController',
     'FlightMode',
     'FlightState',
+    'LandingReason'
     'ControlCommand',
     'Simulator',
     'run_simulation',
+    'SimulationResult',
+    'TerminationReason',
+    'InitialState',
+    'MonteCarloRunner',
+    'MonteCarloStats',
+    'run_monte_carlo',
 ]

@@ -281,6 +281,7 @@ class Drone:
         self.state.vx = 0.0
         self.state.vy = 0.0
         self.state.yaw_rate = 0.0
+        self.state.z = 0.0
     
     def distance_to(self, x: float, y: float, z: float = None) -> float:
         """Calculate 3D distance to a point.
