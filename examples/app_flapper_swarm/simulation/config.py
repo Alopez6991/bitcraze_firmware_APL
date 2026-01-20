@@ -3,26 +3,31 @@ Configuration parameters for the drone swarm simulation.
 
 All distances are in meters, angles in degrees, time in seconds.
 These mirror the parameters from flapper_swarm.c but converted to SI units.
+
+=============================================================================
+THIS IS THE SINGLE SOURCE OF TRUTH FOR ALL TUNABLE PARAMETERS
+Edit the values in `default_config` at the bottom of this file to tune.
+=============================================================================
 """
 from dataclasses import dataclass, field
 from typing import Tuple
 
 
+# =============================================================================
+# FLIGHT PARAMETERS (matching C firmware)
+# =============================================================================
 @dataclass
 class FlightParams:
     """Flight parameters matching the C firmware."""
-    
-    # Target height (not used in 2D sim, but kept for completeness)
-    target_height_m: float = 1.0
     
     # Forward speed in m/s
     fwd_speed_mps: float = 0.5
     
     # Outer emergency boundary to beacon (meters) - land if exceeded
-    dist0_abort_m: float = 4.2
+    dist0_abort_m: float = 3.0
     
     # Inner boundary (meters) - start turning when exceeded
-    inner_bound_m: float = 1.75
+    inner_bound_m: float = 1.30
     
     # Yaw rate while turning (deg/s)
     turn_yaw_rate_dps: float = 40.0
@@ -53,6 +58,9 @@ class FlightParams:
     demo_time_s: float = 60.0
 
 
+# =============================================================================
+# SIMULATION PARAMETERS
+# =============================================================================
 @dataclass
 class SimulationParams:
     """Simulation-specific parameters."""
@@ -67,55 +75,76 @@ class SimulationParams:
     deriv_sample_interval_s: float = 0.02
 
 
+# =============================================================================
+# NOISE PARAMETERS (per-drone)
+# =============================================================================
 @dataclass
-class NoiseParams:
+class DroneNoiseParams:
     """
-    Noise parameters for realistic simulation.
+    Noise parameters for a single drone.
     
     Process noise models imperfect velocity tracking due to estimation errors.
     Sensor noise models UWB distance measurement noise.
     """
     
-    # === Process Noise (velocity tracking errors) ===
-    # These are standard deviations of Gaussian noise added to velocity commands
-    
-    # Forward velocity noise (m/s) - how much vx deviates from commanded
-    process_vx_std: float = 0.02
-    
-    # Lateral velocity noise (m/s) - drift in y direction
-    # This is typically larger due to worse lateral velocity estimation
-    process_vy_std: float = 0.05
-    
-    # Yaw rate noise (deg/s) - how much yaw rate deviates from commanded
-    process_yaw_rate_std: float = 2.0
-    
-    # Lateral velocity bias (m/s) - constant drift in y direction
-    # Set to 0 for no bias, or small value like 0.01-0.05 for drift
-    process_vy_bias: float = 0.0
-    
-    # === Sensor Noise (UWB distance measurements) ===
-    # UWB noise is modeled as Gaussian with optional bias
-    
-    # Distance measurement noise standard deviation (meters)
-    uwb_distance_std: float = 0.05
-    
-    # Distance measurement bias (meters) - systematic error
-    uwb_distance_bias: float = 0.0
-
     # === Enable/Disable Flags ===
     enable_process_noise: bool = True
     enable_sensor_noise: bool = True
+    
+    # === Process Noise (velocity tracking errors) ===
+    # Forward velocity noise std dev (m/s)
+    process_vx_std: float = 0.02
+    
+    # Lateral velocity noise std dev (m/s) - typically larger due to worse estimation
+    process_vy_std: float = 0.05
+    
+    # Yaw rate noise std dev (deg/s)
+    process_yaw_rate_std: float = 2.0
+    
+    # Constant lateral drift (m/s) - set to 0 for no bias
+    process_vy_bias: float = 0.0
+    
+    # === Sensor Noise (UWB distance measurements) ===
+    # Distance measurement noise std dev (meters)
+    uwb_distance_std: float = 0.05
+    
+    # Systematic measurement bias (meters)
+    uwb_distance_bias: float = 0.0
 
 
+# =============================================================================
+# DRONE INITIAL STATE
+# =============================================================================
+@dataclass
+class DroneInitialState:
+    """Initial state for a drone."""
+    x: float = 0.0  # meters
+    y: float = 0.0  # meters
+    yaw: float = 0.0  # degrees
+
+
+# =============================================================================
+# COMPLETE DRONE CONFIGURATION
+# =============================================================================
+@dataclass
+class DroneConfig:
+    """Complete configuration for a single drone (initial state + noise)."""
+    initial: DroneInitialState = field(default_factory=DroneInitialState)
+    noise: DroneNoiseParams = field(default_factory=DroneNoiseParams)
+
+
+# =============================================================================
+# VISUALIZATION PARAMETERS
+# =============================================================================
 @dataclass
 class VisualizationParams:
     """Pygame visualization parameters."""
     
     # Window size in pixels
-    window_size: Tuple[int, int] = (800, 800)
+    window_size: Tuple[int, int] = (900, 900)
     
     # Scale: pixels per meter
-    pixels_per_meter: float = 80.0
+    pixels_per_meter: float = 90.0
     
     # Target FPS
     fps: int = 50
@@ -135,36 +164,117 @@ class VisualizationParams:
     
     # Show trajectory trail
     show_trail: bool = True
-    trail_length: int = 200
+    trail_length: int = 300
 
 
-@dataclass
-class DroneInitialState:
-    """Initial state for a drone."""
-    x: float = 0.0  # meters
-    y: float = 0.0  # meters
-    yaw: float = 0.0  # degrees
-
-
+# =============================================================================
+# MAIN CONFIGURATION CONTAINER
+# =============================================================================
 @dataclass
 class Config:
     """Main configuration container."""
-    flight: FlightParams = field(default_factory=FlightParams)
-    sim: SimulationParams = field(default_factory=SimulationParams)
-    viz: VisualizationParams = field(default_factory=VisualizationParams)
-    noise: NoiseParams = field(default_factory=NoiseParams)
-    
-    # Initial states for drones (can be extended for more drones)
-    drone1_init: DroneInitialState = field(
-        default_factory=lambda: DroneInitialState(x=0.5, y=0.0, yaw=90.0)
-    )
-    drone2_init: DroneInitialState = field(
-        default_factory=lambda: DroneInitialState(x=-0.5, y=0.0, yaw=-90.0)
-    )
     
     # Beacon position (center of the arena)
     beacon_pos: Tuple[float, float] = (0.0, 0.0)
+    
+    # Sub-configurations
+    flight: FlightParams = field(default_factory=FlightParams)
+    sim: SimulationParams = field(default_factory=SimulationParams)
+    viz: VisualizationParams = field(default_factory=VisualizationParams)
+    
+    # Per-drone configurations
+    drone1: DroneConfig = field(default_factory=DroneConfig)
+    drone2: DroneConfig = field(default_factory=DroneConfig)
 
 
-# Default configuration instance
-default_config = Config()
+# =============================================================================
+# DEFAULT CONFIGURATION - EDIT VALUES HERE TO TUNE
+# =============================================================================
+default_config = Config(
+    # -------------------------------------------------------------------------
+    # FLIGHT PARAMETERS
+    # -------------------------------------------------------------------------
+    flight=FlightParams(
+        fwd_speed_mps=0.5,
+        dist0_abort_m=3.0,
+        inner_bound_m=1.30,
+        turn_yaw_rate_dps=40.0,
+        peer_close_m=2.0,
+        avoid_min_land_m=0.6,
+        avoid_speed_factor=1.0,
+        avoid_yaw_rate_dps=70.0,
+        abort_confirm_count=2,
+        avoid_enter_confirm_count=2,
+        avoid_exit_confirm_count=4,
+        des_deriv_mps=-1.4,
+        recover_yaw_rate_dps=50.0,
+        recover_deadzone_dps=30.0,
+        demo_time_s=60.0,
+    ),
+    
+    # -------------------------------------------------------------------------
+    # SIMULATION PARAMETERS
+    # -------------------------------------------------------------------------
+    sim=SimulationParams(
+        dt=0.02,
+        deriv_buffer_size=10,
+        deriv_sample_interval_s=0.02,
+    ),
+    
+    # -------------------------------------------------------------------------
+    # VISUALIZATION PARAMETERS
+    # -------------------------------------------------------------------------
+    viz=VisualizationParams(
+        window_size=(900, 900),
+        pixels_per_meter=90.0,
+        fps=50,
+        show_trail=True,
+        trail_length=300,
+    ),
+    
+    # -------------------------------------------------------------------------
+    # DRONE 1 CONFIGURATION
+    # -------------------------------------------------------------------------
+    drone1=DroneConfig(
+        initial=DroneInitialState(
+            x=0.8,
+            y=0.0,
+            yaw=270.0,
+        ),
+        noise=DroneNoiseParams(
+            enable_process_noise=True,
+            enable_sensor_noise=True,
+            # Process noise
+            process_vx_std=0.02,
+            process_vy_std=0.05,
+            process_yaw_rate_std=2.0,
+            process_vy_bias=0.05,
+            # Sensor noise
+            uwb_distance_std=0.05,
+            uwb_distance_bias=0.0,
+        ),
+    ),
+    
+    # -------------------------------------------------------------------------
+    # DRONE 2 CONFIGURATION
+    # -------------------------------------------------------------------------
+    drone2=DroneConfig(
+        initial=DroneInitialState(
+            x=-0.8,
+            y=0.0,
+            yaw=270.0,
+        ),
+        noise=DroneNoiseParams(
+            enable_process_noise=True,
+            enable_sensor_noise=True,
+            # Process noise
+            process_vx_std=0.02,
+            process_vy_std=0.05,
+            process_yaw_rate_std=2.0,
+            process_vy_bias=0.0,
+            # Sensor noise
+            uwb_distance_std=0.05,
+            uwb_distance_bias=0.0,
+        ),
+    ),
+)

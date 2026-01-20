@@ -8,8 +8,9 @@ from .config import (
     FlightParams,
     SimulationParams,
     VisualizationParams,
-    NoiseParams,
+    DroneNoiseParams,
     DroneInitialState,
+    DroneConfig,
     default_config
 )
 from .drone import (
@@ -28,8 +29,9 @@ __all__ = [
     'FlightParams',
     'SimulationParams',
     'VisualizationParams',
-    'NoiseParams',
+    'DroneNoiseParams',
     'DroneInitialState',
+    'DroneConfig',
     'default_config',
     'Drone',
     'DroneState',

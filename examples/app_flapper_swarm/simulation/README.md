@@ -25,33 +25,33 @@ python run_sim.py
 
 ## Configuration
 
-Edit parameters in `run_sim.py` or create your own configuration:
+**All tunable parameters are in `config.py`** - edit `default_config` at the bottom of that file.
+
+The configuration is organized into sections:
+- **Flight parameters** - Algorithm parameters (speeds, distances, thresholds)
+- **Simulation parameters** - Time step, derivative buffer settings
+- **Visualization parameters** - Window size, colors, trails
+- **Per-drone configurations** - Initial position and noise settings for each drone
+
+### Per-Drone Noise
+
+Each drone has its own noise configuration, allowing you to model different real-world characteristics:
 
 ```python
-from simulation import Config, FlightParams, NoiseParams, run_simulation
-
-config = Config(
-    flight=FlightParams(
-        fwd_speed_mps=0.5,
-        inner_bound_m=1.75,
-        dist0_abort_m=4.2,
-        peer_close_m=2.0,
-        avoid_yaw_rate_dps=70.0,
-    ),
-    noise=NoiseParams(
+drone1=DroneConfig(
+    initial=DroneInitialState(x=0.8, y=0.0, yaw=270.0),
+    noise=DroneNoiseParams(
         enable_process_noise=True,
         enable_sensor_noise=True,
-        process_vy_std=0.05,  # Lateral drift
-        uwb_distance_std=0.05,  # UWB noise
+        process_vx_std=0.02,
+        process_vy_std=0.05,
+        process_vy_bias=0.0,  # Set to non-zero for drift
+        uwb_distance_std=0.05,
     ),
-)
-
-run_simulation(config)
+),
 ```
 
 ## Noise Models
-
-The simulation supports realistic noise modeling:
 
 ### Process Noise (Velocity Tracking Errors)
 
@@ -74,18 +74,16 @@ Models UWB ranging measurement noise:
 | `enable_sensor_noise` | `True` | Enable/disable sensor noise |
 | `uwb_distance_std` | `0.05` m | Distance measurement noise std dev |
 | `uwb_distance_bias` | `0.0` m | Systematic measurement bias |
-| `uwb_outlier_prob` | `0.01` | Probability of outlier (0.0-1.0) |
-| `uwb_outlier_magnitude` | `0.5` m | Outlier magnitude range |
 
 ## Architecture
 
 The simulation is modular for easy extension:
 
-- **`config.py`** - All tunable hyperparameters (flight, noise, visualization)
+- **`config.py`** - **Single source of truth** for all tunable parameters
 - **`drone.py`** - Drone physics (`KinematicPhysics`, `NoisyKinematicPhysics`, `UWBSensor`)
 - **`controller.py`** - Flight control algorithm (swappable)
 - **`simulator.py`** - Main loop and Pygame visualization
-- **`run_sim.py`** - Entry point
+- **`run_sim.py`** - Entry point (just runs with default config)
 
 ### Swapping the Physics Model
 
@@ -116,3 +114,4 @@ Create a new controller class with the same interface as `SwarmController`.
 - **Orange drone**: Drone 2 (yaws CCW during avoidance)
 - **Magenta**: Avoidance mode active
 - **Trails**: Recent trajectory history
+- **HUD**: Shows per-drone noise status (P=Process, S=Sensor)
