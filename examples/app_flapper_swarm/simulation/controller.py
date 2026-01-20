@@ -43,6 +43,7 @@ class StateContext:
     arc_cooldown: bool = False
     arc_yaw_start: float = 0.0
     target_yaw: float = 0.0
+    target_dir: int = 0
     
     # Routine counter
     routines: int = 0
@@ -51,6 +52,7 @@ class StateContext:
     d0: float = 0.0  # Distance to beacon (meters)
     d0_deriv: float = 0.0  # Derivative of d0 (m/s)
     peer_dist: float = 0.0  # Distance to peer drone (meters)
+    peer_dist_deriv: float = 0.0  # Derivative of peer distance (m/s, negative = closing)
 
 
 class DerivativeEstimator:
@@ -175,6 +177,12 @@ class SwarmController:
             sample_interval=sim_params.deriv_sample_interval_s
         )
         
+        # Derivative estimator for peer distance (for cooperative avoidance)
+        self.peer_dist_deriv = DerivativeEstimator(
+            buffer_size=sim_params.deriv_buffer_size,
+            sample_interval=sim_params.deriv_sample_interval_s
+        )
+        
         # Compute recover factor (matching C code: recoverFactor = -(RECOVER_YAWRATE / DES_DERIV))
         self.recover_factor = -(params.recover_yaw_rate_dps / params.des_deriv_mps)
     
@@ -189,6 +197,7 @@ class SwarmController:
         self.depart_count = 0
         self.seq_abort = False
         self.d0_deriv.reset()
+        self.peer_dist_deriv.reset()
         
         # Call onEnter for initial state
         self._on_enter_state(self.current_state)
@@ -214,13 +223,15 @@ class SwarmController:
         """
         p = self.params
         
-        # Update derivative buffer
+        # Update derivative buffers
         self.d0_deriv.add_sample(d0, time)
+        self.peer_dist_deriv.add_sample(peer_dist, time)
         
         # Update context with current sensor readings
         self.ctx.d0 = d0
         self.ctx.d0_deriv = self.d0_deriv.get_derivative()
         self.ctx.peer_dist = peer_dist
+        self.ctx.peer_dist_deriv = self.peer_dist_deriv.get_derivative()
         
         # Check emergency conditions
         should_land = self._check_emergency(d0, peer_dist)
@@ -287,13 +298,9 @@ class SwarmController:
         peer_dist = self.ctx.peer_dist
         
         if peer_dist > 0 and peer_dist <= p.peer_close_m:
-            self.approach_count += 1
-            if self.approach_count >= p.avoid_enter_confirm_count:
-                self.approach_count = 0
-                self.depart_count = 0
-                return True
-        else:
-            self.approach_count = 0
+            # print(self.ctx.peer_dist_deriv)
+            # if (self.ctx.peer_dist_deriv <= -0.3):
+            return True
         return False
     
     def _should_exit_avoid(self) -> bool:
@@ -302,13 +309,7 @@ class SwarmController:
         peer_dist = self.ctx.peer_dist
         
         if peer_dist >= p.peer_close_m:
-            self.depart_count += 1
-            if self.depart_count >= p.avoid_exit_confirm_count:
-                self.depart_count = 0
-                self.approach_count = 0
-                return True
-        else:
-            self.depart_count = 0
+            return True
         return False
     
     # =========================================================================
@@ -334,16 +335,21 @@ class SwarmController:
         """Enter TURN state."""
         self.inner_under_count = 0
         self.ctx.arc_yaw_start = current_yaw
-        self.ctx.target_yaw = self._normalize_angle(current_yaw - 90.0)
+        self.ctx.target_dir = 1 
+        self.ctx.target_yaw = self._normalize_angle(current_yaw - self.ctx.target_dir * 90.0)
         self.ctx.arc_active = math.isfinite(current_yaw)
     
     def _on_enter_avoid(self) -> None:
         """Enter AVOID state."""
+        self.ctx.target_dir = self._get_rotation_dir()
         pass  # Nothing special in C
     
     def _on_enter_recover(self) -> None:
         """Enter RECOVER state."""
-        pass  # Nothing special in C
+        # If the distance to central beacon is larger than max distance - turning radius, we should keep the direction
+        print(f"d0: {self.ctx.d0}, bound: {self.params.dist0_abort_m - 0.8}")
+        if (self.ctx.d0 < self.params.dist0_abort_m - 0.8):
+            self.ctx.target_dir = 1
     
     # =========================================================================
     # State machine: on_exit handlers
@@ -531,9 +537,10 @@ class SwarmController:
         # Yaw rate based on derivative error (matching C code)
         # yawCommand = recoverFactor * fabsf(ctx.d0Deriv - DES_DERIV)
         yaw_cmd = self.recover_factor * abs(ctx.d0_deriv - p.des_deriv_mps)
-        
+        yaw_cmd *= self.ctx.target_dir # keep the last direction to prevent exiting
+
         # Apply deadzone
-        if yaw_cmd <= p.recover_deadzone_dps:
+        if abs(yaw_cmd) <= p.recover_deadzone_dps:
             yaw_cmd = 0.0
         
         return ControlCommand(
@@ -545,13 +552,26 @@ class SwarmController:
     # =========================================================================
     # Helper methods
     # =========================================================================
-    
-    def _get_avoid_yaw_rate(self) -> float:
-        """Get avoidance yaw rate based on drone ID."""
+    def _get_rotation_dir(self) -> int:
+        """Get the rotation direction based on drone ID."""
         if self.drone_id == 1:
-            return self.params.avoid_yaw_rate_dps  # CW (positive)
+            return 1
         else:
-            return -self.params.avoid_yaw_rate_dps  # CCW (negative)
+            return -1
+
+    def _get_avoid_yaw_rate(self) -> float:
+        """Get avoidance yaw rate based on drone ID.""" 
+        # mod_factor = 0
+        # if (self.ctx.peer_dist_deriv > 0):
+        #     mod_factor = abs(self.ctx.peer_dist_deriv / 2) * self.params.avoid_yaw_rate_dps
+        # if self.drone_id == 1:
+        #     return self.params.avoid_yaw_rate_dps - mod_factor # CW (positive)
+        # else:
+        #     return -self.params.avoid_yaw_rate_dps + mod_factor # CCW (negative)
+        if self.drone_id == 1:
+            return self.params.avoid_yaw_rate_dps # CW (positive)
+        else:
+            return -self.params.avoid_yaw_rate_dps # CCW (negative)
     
     @staticmethod
     def _normalize_angle(angle: float) -> float:
