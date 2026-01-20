@@ -68,6 +68,46 @@ class SimulationParams:
 
 
 @dataclass
+class NoiseParams:
+    """
+    Noise parameters for realistic simulation.
+    
+    Process noise models imperfect velocity tracking due to estimation errors.
+    Sensor noise models UWB distance measurement noise.
+    """
+    
+    # === Process Noise (velocity tracking errors) ===
+    # These are standard deviations of Gaussian noise added to velocity commands
+    
+    # Forward velocity noise (m/s) - how much vx deviates from commanded
+    process_vx_std: float = 0.02
+    
+    # Lateral velocity noise (m/s) - drift in y direction
+    # This is typically larger due to worse lateral velocity estimation
+    process_vy_std: float = 0.05
+    
+    # Yaw rate noise (deg/s) - how much yaw rate deviates from commanded
+    process_yaw_rate_std: float = 2.0
+    
+    # Lateral velocity bias (m/s) - constant drift in y direction
+    # Set to 0 for no bias, or small value like 0.01-0.05 for drift
+    process_vy_bias: float = 0.0
+    
+    # === Sensor Noise (UWB distance measurements) ===
+    # UWB noise is modeled as Gaussian with optional bias
+    
+    # Distance measurement noise standard deviation (meters)
+    uwb_distance_std: float = 0.05
+    
+    # Distance measurement bias (meters) - systematic error
+    uwb_distance_bias: float = 0.0
+
+    # === Enable/Disable Flags ===
+    enable_process_noise: bool = True
+    enable_sensor_noise: bool = True
+
+
+@dataclass
 class VisualizationParams:
     """Pygame visualization parameters."""
     
@@ -112,6 +152,7 @@ class Config:
     flight: FlightParams = field(default_factory=FlightParams)
     sim: SimulationParams = field(default_factory=SimulationParams)
     viz: VisualizationParams = field(default_factory=VisualizationParams)
+    noise: NoiseParams = field(default_factory=NoiseParams)
     
     # Initial states for drones (can be extended for more drones)
     drone1_init: DroneInitialState = field(

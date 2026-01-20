@@ -15,7 +15,7 @@ except ImportError:
     sys.exit(1)
 
 from .config import Config, default_config
-from .drone import Drone, DroneState
+from .drone import Drone, DroneState, NoisyKinematicPhysics, KinematicPhysics, UWBSensor
 from .controller import SwarmController, FlightMode
 
 
@@ -46,6 +46,14 @@ class Simulator:
         self.clock = pygame.time.Clock()
         self.font = pygame.font.Font(None, 24)
         
+        # Create UWB sensor model
+        noise = self.config.noise
+        self.uwb_sensor = UWBSensor(
+            distance_std=noise.uwb_distance_std,
+            distance_bias=noise.uwb_distance_bias,
+            enabled=noise.enable_sensor_noise
+        )
+        
         # Create drones
         self.drones: List[Drone] = []
         self.controllers: List[SwarmController] = []
@@ -58,6 +66,25 @@ class Simulator:
     def _init_drones(self) -> None:
         """Initialize drones and controllers."""
         cfg = self.config
+        noise = cfg.noise
+        
+        # Select physics model based on noise configuration
+        if noise.enable_process_noise:
+            physics1 = NoisyKinematicPhysics(
+                vx_std=noise.process_vx_std,
+                vy_std=noise.process_vy_std,
+                yaw_rate_std=noise.process_yaw_rate_std,
+                vy_bias=noise.process_vy_bias
+            )
+            physics2 = NoisyKinematicPhysics(
+                vx_std=noise.process_vx_std,
+                vy_std=noise.process_vy_std,
+                yaw_rate_std=noise.process_yaw_rate_std,
+                vy_bias=noise.process_vy_bias
+            )
+        else:
+            physics1 = KinematicPhysics()
+            physics2 = KinematicPhysics()
         
         # Drone 1
         drone1 = Drone(
@@ -65,6 +92,7 @@ class Simulator:
             initial_x=cfg.drone1_init.x,
             initial_y=cfg.drone1_init.y,
             initial_yaw=cfg.drone1_init.yaw,
+            physics_model=physics1,
             trail_length=cfg.viz.trail_length
         )
         controller1 = SwarmController(
@@ -79,6 +107,7 @@ class Simulator:
             initial_x=cfg.drone2_init.x,
             initial_y=cfg.drone2_init.y,
             initial_yaw=cfg.drone2_init.yaw,
+            physics_model=physics2,
             trail_length=cfg.viz.trail_length
         )
         controller2 = SwarmController(
@@ -97,17 +126,8 @@ class Simulator:
         self.min_peer_distance = float('inf')
         self.avoidance_events = 0
         
-        # Reset drones
-        self.drones[0].reset(
-            cfg.drone1_init.x,
-            cfg.drone1_init.y,
-            cfg.drone1_init.yaw
-        )
-        self.drones[1].reset(
-            cfg.drone2_init.x,
-            cfg.drone2_init.y,
-            cfg.drone2_init.yaw
-        )
+        # Reinitialize drones with fresh physics models
+        self._init_drones()
         
         # Reset controllers
         for ctrl in self.controllers:
@@ -171,17 +191,21 @@ class Simulator:
             # Get other drone for peer distance
             other_drone = self.drones[1 - i]
             
-            # Calculate distances
-            d0 = drone.distance_to(*beacon)
-            peer_dist = drone.distance_to_drone(other_drone)
+            # Calculate TRUE distances (for statistics)
+            true_d0 = drone.distance_to(*beacon)
+            true_peer_dist = drone.distance_to_drone(other_drone)
             
-            # Track minimum peer distance
-            self.min_peer_distance = min(self.min_peer_distance, peer_dist)
+            # Track minimum TRUE peer distance (for collision detection stats)
+            self.min_peer_distance = min(self.min_peer_distance, true_peer_dist)
             
-            # Get control command
+            # Get MEASURED distances (with sensor noise for controller)
+            measured_d0 = self.uwb_sensor.measure(true_d0)
+            measured_peer_dist = self.uwb_sensor.measure(true_peer_dist)
+            
+            # Get control command using MEASURED (noisy) distances
             cmd, should_land = ctrl.update(
-                d0=d0,
-                peer_dist=peer_dist,
+                d0=measured_d0,
+                peer_dist=measured_peer_dist,
                 current_yaw=drone.yaw,
                 time=self.time
             )
@@ -277,11 +301,21 @@ class Simulator:
         """Render heads-up display with status info."""
         viz = self.config.viz
         flight = self.config.flight
+        noise = self.config.noise
+        
+        # Noise status indicator
+        noise_status = []
+        if noise.enable_process_noise:
+            noise_status.append("Process")
+        if noise.enable_sensor_noise:
+            noise_status.append("Sensor")
+        noise_str = "+".join(noise_status) if noise_status else "None"
         
         lines = [
             f"Time: {self.time:.1f}s / {flight.demo_time_s:.1f}s",
             f"Min peer dist: {self.min_peer_distance:.2f}m",
             f"Avoidance events: {self.avoidance_events}",
+            f"Noise: {noise_str}",
             "",
         ]
         

@@ -18,7 +18,7 @@ script_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(script_dir)
 sys.path.insert(0, parent_dir)
 
-from simulation import run_simulation, Config, FlightParams, VisualizationParams, DroneInitialState
+from simulation import run_simulation, Config, FlightParams, VisualizationParams, NoiseParams, DroneInitialState
 
 
 def main():
@@ -51,6 +51,33 @@ def main():
             # Demo duration (seconds)
             demo_time_s=60.0,
         ),
+        noise=NoiseParams(
+            # === Process Noise (velocity tracking errors) ===
+            # Enable/disable process noise
+            enable_process_noise=True,
+            
+            # Forward velocity noise std dev (m/s)
+            process_vx_std=0.02,
+            
+            # Lateral velocity noise std dev (m/s) - typically larger due to worse estimation
+            process_vy_std=0.05,
+            
+            # Yaw rate noise std dev (deg/s)
+            process_yaw_rate_std=2.0,
+            
+            # Constant lateral drift (m/s) - set to 0 for no bias
+            process_vy_bias=0.10,
+            
+            # === Sensor Noise (UWB distance measurements) ===
+            # Enable/disable sensor noise
+            enable_sensor_noise=True,
+            
+            # Distance measurement noise std dev (meters)
+            uwb_distance_std=0.05,
+            
+            # Systematic measurement bias (meters)
+            uwb_distance_bias=0.0,
+        ),
         viz=VisualizationParams(
             # Window size
             window_size=(900, 900),
@@ -81,6 +108,15 @@ def main():
     print(f"  Outer boundary: {config.flight.dist0_abort_m}m")
     print(f"  Avoidance distance: {config.flight.peer_close_m}m")
     print(f"  Forward speed: {config.flight.fwd_speed_mps}m/s")
+    print()
+    print("Noise settings:")
+    print(f"  Process noise: {'ON' if config.noise.enable_process_noise else 'OFF'}")
+    if config.noise.enable_process_noise:
+        print(f"    vx_std={config.noise.process_vx_std}m/s, vy_std={config.noise.process_vy_std}m/s")
+        print(f"    yaw_rate_std={config.noise.process_yaw_rate_std}deg/s, vy_bias={config.noise.process_vy_bias}m/s")
+    print(f"  Sensor noise: {'ON' if config.noise.enable_sensor_noise else 'OFF'}")
+    if config.noise.enable_sensor_noise:
+        print(f"    uwb_std={config.noise.uwb_distance_std}m")
     print()
     
     run_simulation(config)

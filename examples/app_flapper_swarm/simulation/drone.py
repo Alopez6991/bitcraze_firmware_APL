@@ -6,8 +6,9 @@ and kinematics of a drone. The physics model is kept simple and modular
 so it can be extended with dynamics later.
 """
 import math
+import random
 from dataclasses import dataclass, field
-from typing import Tuple, List, Protocol
+from typing import Tuple, List, Protocol, Optional
 from enum import Enum, auto
 
 
@@ -88,6 +89,90 @@ class KinematicPhysics:
             vx=vx_world,
             vy=vy_world,
             yaw_rate=cmd_yaw_rate
+        )
+        
+        return new_state
+    
+    @staticmethod
+    def _normalize_angle(angle: float) -> float:
+        """Normalize angle to [-180, 180] degrees."""
+        while angle > 180:
+            angle -= 360
+        while angle <= -180:
+            angle += 360
+        return angle
+
+
+class NoisyKinematicPhysics:
+    """
+    Kinematic physics model with process noise.
+    
+    Models imperfect velocity tracking due to estimation errors.
+    Noise is added to the commanded velocities before integration.
+    """
+    
+    def __init__(
+        self,
+        vx_std: float = 0.02,
+        vy_std: float = 0.05,
+        yaw_rate_std: float = 2.0,
+        vy_bias: float = 0.0
+    ):
+        """
+        Initialize noisy physics model.
+        
+        Args:
+            vx_std: Forward velocity noise std dev (m/s)
+            vy_std: Lateral velocity noise std dev (m/s)
+            yaw_rate_std: Yaw rate noise std dev (deg/s)
+            vy_bias: Constant lateral velocity bias (m/s)
+        """
+        self.vx_std = vx_std
+        self.vy_std = vy_std
+        self.yaw_rate_std = yaw_rate_std
+        self.vy_bias = vy_bias
+    
+    def update(
+        self,
+        state: DronePhysicsState,
+        cmd_vx_body: float,
+        cmd_vy_body: float,
+        cmd_yaw_rate: float,
+        dt: float
+    ) -> DronePhysicsState:
+        """
+        Update physics state with noisy velocity commands.
+        
+        Args:
+            state: Current physics state
+            cmd_vx_body: Commanded forward velocity (m/s) in body frame
+            cmd_vy_body: Commanded lateral velocity (m/s) in body frame
+            cmd_yaw_rate: Commanded yaw rate (deg/s)
+            dt: Time step (seconds)
+            
+        Returns:
+            New physics state
+        """
+        # Add process noise to commands (in body frame)
+        noisy_vx = cmd_vx_body + random.gauss(0, self.vx_std)
+        noisy_vy = cmd_vy_body + random.gauss(0, self.vy_std) + self.vy_bias
+        noisy_yaw_rate = cmd_yaw_rate + random.gauss(0, self.yaw_rate_std)
+        
+        # Convert yaw to radians for trig
+        yaw_rad = math.radians(state.yaw)
+        
+        # Transform body velocities to world frame
+        vx_world = noisy_vx * math.cos(yaw_rad) - noisy_vy * math.sin(yaw_rad)
+        vy_world = noisy_vx * math.sin(yaw_rad) + noisy_vy * math.cos(yaw_rad)
+        
+        # Update state
+        new_state = DronePhysicsState(
+            x=state.x + vx_world * dt,
+            y=state.y + vy_world * dt,
+            yaw=self._normalize_angle(state.yaw + noisy_yaw_rate * dt),
+            vx=vx_world,
+            vy=vy_world,
+            yaw_rate=noisy_yaw_rate
         )
         
         return new_state
@@ -220,3 +305,70 @@ class Drone:
         self.state = DronePhysicsState(x=x, y=y, yaw=yaw)
         self.flight_state = DroneState.IDLE
         self.trail.clear()
+
+
+class UWBSensor:
+    """
+    UWB distance sensor model with noise.
+    
+    Models the noise characteristics of UWB ranging measurements
+    including Gaussian noise, bias.
+    """
+    
+    def __init__(
+        self,
+        distance_std: float = 0.05,
+        distance_bias: float = 0.0,
+        enabled: bool = True
+    ):
+        """
+        Initialize UWB sensor model.
+        
+        Args:
+            distance_std: Distance measurement noise std dev (meters)
+            distance_bias: Systematic measurement bias (meters)
+            enabled: Whether noise is enabled
+        """
+        self.distance_std = distance_std
+        self.distance_bias = distance_bias
+        self.enabled = enabled
+    
+    def measure(self, true_distance: float) -> float:
+        """
+        Get a noisy distance measurement.
+        
+        Args:
+            true_distance: Actual distance (meters)
+            
+        Returns:
+            Noisy distance measurement (meters), always >= 0
+        """
+        if not self.enabled:
+            return true_distance
+        
+        # Start with true distance plus bias
+        measurement = true_distance + self.distance_bias
+        
+        # Add Gaussian noise
+        measurement += random.gauss(0, self.distance_std)
+        
+        # Distance can't be negative
+        return max(0.0, measurement)
+    
+    def measure_distance_between(
+        self,
+        x1: float, y1: float,
+        x2: float, y2: float
+    ) -> float:
+        """
+        Measure noisy distance between two points.
+        
+        Args:
+            x1, y1: First point coordinates
+            x2, y2: Second point coordinates
+            
+        Returns:
+            Noisy distance measurement (meters)
+        """
+        true_distance = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        return self.measure(true_distance)
