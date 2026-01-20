@@ -235,15 +235,27 @@ class Simulator:
         self.screen.fill(viz.background_color)
         
         # Draw boundaries (use only x, y for 2D visualization)
-        beacon_x, beacon_y, _ = self.config.beacon_pos
+        beacon_x, beacon_y, beacon_z = self.config.beacon_pos
         center = self._world_to_screen(beacon_x, beacon_y)
         
-        # Outer abort boundary
-        outer_radius = int(flight.dist0_abort_m * viz.pixels_per_meter)
+        # Get flying altitude (use first flying drone's z, or default to drone config)
+        flying_z = self.config.drone1.initial.z
+        for drone in self.drones:
+            if drone.is_flying:
+                flying_z = drone.state.z
+            break
+        
+        # Calculate horizontal distance scaling factor due to altitude difference
+        dz = abs(flying_z - beacon_z)
+        
+        # Outer abort boundary (adjusted for altitude)
+        outer_radius_3d = math.sqrt(flight.dist0_abort_m**2 - dz**2) if flight.dist0_abort_m > dz else 0
+        outer_radius = int(outer_radius_3d * viz.pixels_per_meter)
         pygame.draw.circle(self.screen, viz.outer_bound_color, center, outer_radius, 2)
         
-        # Inner turn boundary
-        inner_radius = int(flight.inner_bound_m * viz.pixels_per_meter)
+        # Inner turn boundary (adjusted for altitude)
+        inner_radius_3d = math.sqrt(flight.inner_bound_m**2 - dz**2) if flight.inner_bound_m > dz else 0
+        inner_radius = int(inner_radius_3d * viz.pixels_per_meter)
         pygame.draw.circle(self.screen, viz.inner_bound_color, center, inner_radius, 2)
         
         # Peer avoidance radius (for reference)
