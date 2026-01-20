@@ -120,6 +120,7 @@ class DroneInitialState:
     """Initial state for a drone."""
     x: float = 0.0  # meters
     y: float = 0.0  # meters
+    z: float = 0.0  # meters (altitude)
     yaw: float = 0.0  # degrees
 
 
@@ -175,7 +176,7 @@ class Config:
     """Main configuration container."""
     
     # Beacon position (center of the arena)
-    beacon_pos: Tuple[float, float] = (0.0, 0.0)
+    beacon_pos: Tuple[float, float, float] = (0.0, 0.0, 0.0)  # (x, y, z) in meters
     
     # Sub-configurations
     flight: FlightParams = field(default_factory=FlightParams)
@@ -199,7 +200,7 @@ default_config = Config(
         dist0_abort_m=3.0,
         inner_bound_m=1.30,
         turn_yaw_rate_dps=40.0,
-        peer_close_m=2.0,
+        peer_close_m=1.8,
         avoid_min_land_m=0.6,
         avoid_speed_factor=1.0,
         avoid_yaw_rate_dps=70.0,
@@ -239,6 +240,7 @@ default_config = Config(
         initial=DroneInitialState(
             x=0.8,
             y=0.0,
+            z=1.0,  # Flying altitude (meters)
             yaw=270.0,
         ),
         noise=DroneNoiseParams(
@@ -260,8 +262,9 @@ default_config = Config(
     # -------------------------------------------------------------------------
     drone2=DroneConfig(
         initial=DroneInitialState(
-            x=-0.8,
+            x=-1.0,
             y=0.0,
+            z=1.0,  # Flying altitude (meters)
             yaw=270.0,
         ),
         noise=DroneNoiseParams(

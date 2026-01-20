@@ -1,9 +1,10 @@
 """
-Drone physics model for 2D simulation.
+Drone physics model for simulation.
 
 This module contains the Drone class which handles the physical state
 and kinematics of a drone. The physics model is kept simple and modular
-so it can be extended with dynamics later.
+so it can be extended with dynamics later. The simulation uses 3D positions
+but with fixed altitude for proper distance calculations.
 """
 import math
 import random
@@ -21,9 +22,10 @@ class DroneState(Enum):
 
 @dataclass
 class DronePhysicsState:
-    """Physical state of a drone in 2D."""
+    """Physical state of a drone in 3D (with fixed altitude)."""
     x: float = 0.0  # Position X (meters)
     y: float = 0.0  # Position Y (meters)
+    z: float = 0.0  # Position Z / altitude (meters)
     yaw: float = 0.0  # Heading (degrees, 0 = +X axis, CCW positive)
     vx: float = 0.0  # Velocity X (m/s) - world frame
     vy: float = 0.0  # Velocity Y (m/s) - world frame
@@ -81,10 +83,11 @@ class KinematicPhysics:
         vx_world = cmd_vx_body * math.cos(yaw_rad) - cmd_vy_body * math.sin(yaw_rad)
         vy_world = cmd_vx_body * math.sin(yaw_rad) + cmd_vy_body * math.cos(yaw_rad)
         
-        # Update state
+        # Update state (z remains constant - altitude hold)
         new_state = DronePhysicsState(
             x=state.x + vx_world * dt,
             y=state.y + vy_world * dt,
+            z=state.z,
             yaw=self._normalize_angle(state.yaw + cmd_yaw_rate * dt),
             vx=vx_world,
             vy=vy_world,
@@ -165,10 +168,11 @@ class NoisyKinematicPhysics:
         vx_world = noisy_vx * math.cos(yaw_rad) - noisy_vy * math.sin(yaw_rad)
         vy_world = noisy_vx * math.sin(yaw_rad) + noisy_vy * math.cos(yaw_rad)
         
-        # Update state
+        # Update state (z remains constant - altitude hold)
         new_state = DronePhysicsState(
             x=state.x + vx_world * dt,
             y=state.y + vy_world * dt,
+            z=state.z,
             yaw=self._normalize_angle(state.yaw + noisy_yaw_rate * dt),
             vx=vx_world,
             vy=vy_world,
@@ -200,6 +204,7 @@ class Drone:
         drone_id: int,
         initial_x: float = 0.0,
         initial_y: float = 0.0,
+        initial_z: float = 0.0,
         initial_yaw: float = 0.0,
         physics_model: PhysicsModel = None,
         trail_length: int = 200
@@ -211,6 +216,7 @@ class Drone:
             drone_id: Unique identifier (1 or 2 for the two-drone scenario)
             initial_x: Initial X position (meters)
             initial_y: Initial Y position (meters)
+            initial_z: Initial Z position / altitude (meters)
             initial_yaw: Initial heading (degrees)
             physics_model: Physics model to use (default: KinematicPhysics)
             trail_length: Number of positions to store for trail visualization
@@ -223,6 +229,7 @@ class Drone:
         self.state = DronePhysicsState(
             x=initial_x,
             y=initial_y,
+            z=initial_z,
             yaw=initial_yaw
         )
         self.flight_state = DroneState.IDLE
@@ -275,15 +282,25 @@ class Drone:
         self.state.vy = 0.0
         self.state.yaw_rate = 0.0
     
-    def distance_to(self, x: float, y: float) -> float:
-        """Calculate distance to a point."""
+    def distance_to(self, x: float, y: float, z: float = None) -> float:
+        """Calculate 3D distance to a point.
+        
+        Args:
+            x: X coordinate of the point
+            y: Y coordinate of the point
+            z: Z coordinate of the point (if None, uses drone's z for 2D distance)
+        """
         dx = self.state.x - x
         dy = self.state.y - y
-        return math.sqrt(dx * dx + dy * dy)
+        if z is None:
+            dz = 0.0
+        else:
+            dz = self.state.z - z
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
     
     def distance_to_drone(self, other: 'Drone') -> float:
-        """Calculate distance to another drone."""
-        return self.distance_to(other.state.x, other.state.y)
+        """Calculate 3D distance to another drone."""
+        return self.distance_to(other.state.x, other.state.y, other.state.z)
     
     @property
     def position(self) -> Tuple[float, float]:
@@ -300,9 +317,17 @@ class Drone:
         """Check if drone is currently flying."""
         return self.flight_state == DroneState.FLYING
     
-    def reset(self, x: float, y: float, yaw: float) -> None:
-        """Reset drone to initial state."""
-        self.state = DronePhysicsState(x=x, y=y, yaw=yaw)
+    def reset(self, x: float, y: float, yaw: float, z: float = None) -> None:
+        """Reset drone to initial state.
+        
+        Args:
+            x: X position (meters)
+            y: Y position (meters)
+            yaw: Heading (degrees)
+            z: Z position / altitude (meters), if None keeps current z
+        """
+        current_z = self.state.z if z is None else z
+        self.state = DronePhysicsState(x=x, y=y, z=current_z, yaw=yaw)
         self.flight_state = DroneState.IDLE
         self.trail.clear()
 
@@ -357,18 +382,18 @@ class UWBSensor:
     
     def measure_distance_between(
         self,
-        x1: float, y1: float,
-        x2: float, y2: float
+        x1: float, y1: float, z1: float,
+        x2: float, y2: float, z2: float
     ) -> float:
         """
-        Measure noisy distance between two points.
+        Measure noisy 3D distance between two points.
         
         Args:
-            x1, y1: First point coordinates
-            x2, y2: Second point coordinates
+            x1, y1, z1: First point coordinates
+            x2, y2, z2: Second point coordinates
             
         Returns:
             Noisy distance measurement (meters)
         """
-        true_distance = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2)
+        true_distance = math.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
         return self.measure(true_distance)

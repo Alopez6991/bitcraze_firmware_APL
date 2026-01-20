@@ -87,6 +87,7 @@ class Simulator:
                 drone_id=drone_id,
                 initial_x=init.x,
                 initial_y=init.y,
+                initial_z=init.z,
                 initial_yaw=init.yaw,
                 physics_model=physics,
                 trail_length=cfg.viz.trail_length
@@ -233,8 +234,9 @@ class Simulator:
         # Clear screen
         self.screen.fill(viz.background_color)
         
-        # Draw boundaries
-        center = self._world_to_screen(*self.config.beacon_pos)
+        # Draw boundaries (use only x, y for 2D visualization)
+        beacon_x, beacon_y, _ = self.config.beacon_pos
+        center = self._world_to_screen(beacon_x, beacon_y)
         
         # Outer abort boundary
         outer_radius = int(flight.dist0_abort_m * viz.pixels_per_meter)
