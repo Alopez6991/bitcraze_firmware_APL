@@ -21,7 +21,7 @@ from .drone import (
     NoisyKinematicPhysics,
     UWBSensor
 )
-from .controller import SwarmController, FlightMode, ControlCommand
+from .controller import SwarmController, FlightMode, FlightState, ControlCommand
 from .simulator import Simulator, run_simulation
 
 __all__ = [
@@ -41,6 +41,7 @@ __all__ = [
     'UWBSensor',
     'SwarmController',
     'FlightMode',
+    'FlightState',
     'ControlCommand',
     'Simulator',
     'run_simulation',

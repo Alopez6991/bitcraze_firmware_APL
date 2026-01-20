@@ -1,23 +1,30 @@
 """
 Flight controller for the drone swarm simulation.
 
-This module implements the control logic from flapper_swarm.c.
-The controller is modular and can be swapped for different algorithms.
+This module implements the control logic from flapper_swarm.c as a proper state machine.
+The controller mirrors the C firmware's state machine structure with:
+  - STATE_STRAIGHT: Flying straight forward
+  - STATE_TURN: Turning at boundary (90° arc)
+  - STATE_AVOID: Avoiding peer drone
+  - STATE_RECOVER: Recovery mode to return to inner circle
+
+Each state has: on_enter, on_exit, check_transition, execute
 """
 import math
 from dataclasses import dataclass, field
-from typing import Tuple, List, Optional, Protocol
+from typing import Tuple, Optional
 from enum import Enum, auto
 from collections import deque
 
 from .config import FlightParams, SimulationParams
 
 
-class FlightMode(Enum):
-    """Flight mode of the drone."""
-    STRAIGHT = auto()  # Flying straight forward
-    TURN = auto()       # Turning at boundary
-    RECOVER = auto()    # Recovery mode after turn
+class FlightState(Enum):
+    """Flight state of the drone (matching C enum)."""
+    STRAIGHT = 0
+    TURN = 1
+    AVOID = 2
+    RECOVER = 3
 
 
 @dataclass
@@ -29,33 +36,21 @@ class ControlCommand:
 
 
 @dataclass
-class ControllerState:
-    """Internal state of the controller."""
-    mode: FlightMode = FlightMode.STRAIGHT
-    
-    # Confirmation counters
-    abort_over_count: int = 0
-    inner_over_count: int = 0
-    inner_under_count: int = 0
-    
-    # Avoidance state
-    avoid_active: bool = False
-    approach_count: int = 0
-    depart_count: int = 0
-    avoid_was_active: bool = False
-    
-    # Arc tracking for turns
+class StateContext:
+    """State machine context (shared between state handlers)."""
+    # Arc tracking (TURN state)
     arc_active: bool = False
     arc_cooldown: bool = False
     arc_yaw_start: float = 0.0
     target_yaw: float = 0.0
     
-    # Emergency flag
-    seq_abort: bool = False
+    # Routine counter
+    routines: int = 0
     
-    # Derivative buffer for d0
-    d0_buffer: deque = field(default_factory=lambda: deque(maxlen=10))
-    last_sample_time: float = 0.0
+    # Current sensor readings (updated each loop)
+    d0: float = 0.0  # Distance to beacon (meters)
+    d0_deriv: float = 0.0  # Derivative of d0 (m/s)
+    peer_dist: float = 0.0  # Distance to peer drone (meters)
 
 
 class DerivativeEstimator:
@@ -63,6 +58,7 @@ class DerivativeEstimator:
     Estimates derivative of distance using linear regression.
     
     Uses a circular buffer of samples to compute the slope via least squares.
+    Matches the C firmware's d0BufferGetDerivative() function.
     """
     
     def __init__(self, buffer_size: int = 10, sample_interval: float = 0.02):
@@ -131,10 +127,12 @@ class DerivativeEstimator:
 
 class SwarmController:
     """
-    Controller implementing the flapper swarm algorithm.
+    Controller implementing the flapper swarm algorithm as a state machine.
     
     Each drone has its own controller instance. The controller makes decisions
     based on distance to beacon and distance to peer drone.
+    
+    State machine structure matches flapper_swarm.c exactly.
     """
     
     def __init__(
@@ -155,8 +153,21 @@ class SwarmController:
         self.params = params
         self.sim_params = sim_params
         
-        # Internal state
-        self.state = ControllerState()
+        # Current state
+        self.current_state = FlightState.STRAIGHT
+        
+        # State context (shared data)
+        self.ctx = StateContext()
+        
+        # Confirmation counters
+        self.abort_over_count = 0
+        self.inner_over_count = 0
+        self.inner_under_count = 0
+        self.approach_count = 0
+        self.depart_count = 0
+        
+        # Emergency flag
+        self.seq_abort = False
         
         # Derivative estimator for beacon distance
         self.d0_deriv = DerivativeEstimator(
@@ -164,13 +175,23 @@ class SwarmController:
             sample_interval=sim_params.deriv_sample_interval_s
         )
         
-        # Compute recover factor (matching C code)
+        # Compute recover factor (matching C code: recoverFactor = -(RECOVER_YAWRATE / DES_DERIV))
         self.recover_factor = -(params.recover_yaw_rate_dps / params.des_deriv_mps)
     
     def reset(self) -> None:
         """Reset controller state."""
-        self.state = ControllerState()
+        self.current_state = FlightState.STRAIGHT
+        self.ctx = StateContext()
+        self.abort_over_count = 0
+        self.inner_over_count = 0
+        self.inner_under_count = 0
+        self.approach_count = 0
+        self.depart_count = 0
+        self.seq_abort = False
         self.d0_deriv.reset()
+        
+        # Call onEnter for initial state
+        self._on_enter_state(self.current_state)
     
     def update(
         self,
@@ -193,9 +214,13 @@ class SwarmController:
         """
         p = self.params
         
-        # Add to derivative buffer
+        # Update derivative buffer
         self.d0_deriv.add_sample(d0, time)
-        d0_deriv = self.d0_deriv.get_derivative()
+        
+        # Update context with current sensor readings
+        self.ctx.d0 = d0
+        self.ctx.d0_deriv = self.d0_deriv.get_derivative()
+        self.ctx.peer_dist = peer_dist
         
         # Check emergency conditions
         should_land = self._check_emergency(d0, peer_dist)
@@ -203,180 +228,323 @@ class SwarmController:
             return ControlCommand(), True
         
         # Clear arc cooldown once we re-enter the inner circle
-        if self.state.arc_cooldown and d0 <= p.inner_bound_m:
-            self.state.arc_cooldown = False
+        if self.ctx.arc_cooldown and d0 > 0 and d0 <= p.inner_bound_m:
+            self.ctx.arc_cooldown = False
         
-        # Mode transitions
-        self._update_mode_transitions(d0, current_yaw, d0_deriv)
+        # State machine: check transitions
+        next_state = self._check_transition(self.current_state, current_yaw)
         
-        # Update avoidance mode
-        self.state.avoid_was_active = self.state.avoid_active
-        avoid = self._update_avoidance(peer_dist)
+        if next_state != self.current_state:
+            self._on_exit_state(self.current_state)
+            self.current_state = next_state
+            self._on_enter_state(self.current_state, current_yaw)
         
-        # After exiting avoidance, if outside inner bound, go to recover
-        if self.state.avoid_was_active and not avoid and d0 >= p.inner_bound_m:
-            self.state.mode = FlightMode.RECOVER
+        if self.seq_abort:
+            return ControlCommand(), True
         
-        # Generate command based on mode
-        cmd = self._generate_command(avoid, d0, d0_deriv)
+        # Execute current state
+        cmd = self._execute_state(self.current_state)
         
         return cmd, False
     
+    # =========================================================================
+    # Emergency checks
+    # =========================================================================
+    
     def _check_emergency(self, d0: float, peer_dist: float) -> bool:
         """
-        Check emergency conditions.
+        Check emergency conditions (matching C firmware).
         
         Returns:
             True if should emergency land
         """
         p = self.params
         
-        # Check outer boundary
+        # Check outer boundary (distance0 abort)
         if d0 > p.dist0_abort_m:
-            self.state.abort_over_count += 1
-            if self.state.abort_over_count >= p.abort_confirm_count:
-                self.state.seq_abort = True
+            self.abort_over_count += 1
+            if self.abort_over_count >= p.abort_confirm_count:
+                self.seq_abort = True
                 return True
         else:
-            self.state.abort_over_count = 0
+            self.abort_over_count = 0
         
-        # Check peer collision during avoidance
-        if self.state.avoid_active and peer_dist > 0 and peer_dist <= p.avoid_min_land_m:
-            self.state.seq_abort = True
+        # Check peer collision during AVOID state
+        if (self.current_state == FlightState.AVOID and 
+            peer_dist > 0 and peer_dist <= p.avoid_min_land_m):
+            self.seq_abort = True
             return True
         
         return False
     
-    def _update_mode_transitions(
-        self,
-        d0: float,
-        current_yaw: float,
-        d0_deriv: float
-    ) -> None:
-        """Update flight mode based on distance to beacon."""
-        p = self.params
-        
-        if self.state.mode == FlightMode.STRAIGHT:
-            # Check if we should start turning
-            if d0 >= p.inner_bound_m:
-                if not self.state.arc_cooldown:
-                    self.state.inner_over_count += 1
-                    if self.state.inner_over_count >= p.abort_confirm_count:
-                        self.state.mode = FlightMode.TURN
-                        self.state.inner_over_count = 0
-                        self.state.arc_yaw_start = current_yaw
-                        self.state.target_yaw = self._normalize_angle(current_yaw - 90.0)
-                        self.state.arc_active = True
-            else:
-                self.state.inner_over_count = 0
-                
-        elif self.state.mode == FlightMode.TURN:
-            # Check if we should exit turn
-            if d0 <= p.inner_bound_m:
-                self.state.inner_under_count += 1
-                if self.state.inner_under_count >= p.abort_confirm_count:
-                    self.state.mode = FlightMode.STRAIGHT
-                    self.state.inner_under_count = 0
-            else:
-                self.state.inner_under_count = 0
-            
-            # Arc tracking: check if we've reached target yaw
-            if self.state.arc_active:
-                yaw_diff = abs(current_yaw - self.state.target_yaw)
-                # Handle wrap-around
-                if yaw_diff > 180:
-                    yaw_diff = 360 - yaw_diff
-                
-                if yaw_diff <= 3.0:
-                    self.state.arc_active = False
-                    self.state.arc_cooldown = True
-                    self.state.inner_under_count = 0
-                    
-                    # Check if we need recovery
-                    if d0_deriv > 0:
-                        self.state.mode = FlightMode.RECOVER
-                    else:
-                        self.state.mode = FlightMode.STRAIGHT
-        
-        elif self.state.mode == FlightMode.RECOVER:
-            # Exit recovery when back inside inner bound
-            if d0 <= p.inner_bound_m:
-                self.state.mode = FlightMode.STRAIGHT
+    # =========================================================================
+    # Avoidance confirmation logic (matching C firmware)
+    # =========================================================================
     
-    def _update_avoidance(self, peer_dist: float) -> bool:
-        """
-        Update avoidance mode based on peer distance.
-        
-        Returns:
-            True if avoidance is active
-        """
+    def _should_enter_avoid(self) -> bool:
+        """Check if peer is too close and we should enter AVOID state."""
         p = self.params
+        peer_dist = self.ctx.peer_dist
         
-        if not self.state.avoid_active:
-            # Check if we should enter avoidance
-            if peer_dist > 0 and peer_dist <= p.peer_close_m:
-                self.state.approach_count += 1
-                if self.state.approach_count >= p.avoid_enter_confirm_count:
-                    self.state.avoid_active = True
-                    self.state.approach_count = 0
-                    self.state.depart_count = 0
-            else:
-                self.state.approach_count = 0
+        if peer_dist > 0 and peer_dist <= p.peer_close_m:
+            self.approach_count += 1
+            if self.approach_count >= p.avoid_enter_confirm_count:
+                self.approach_count = 0
+                self.depart_count = 0
+                return True
         else:
-            # Check if we should exit avoidance
-            if peer_dist >= p.peer_close_m:
-                self.state.depart_count += 1
-                if self.state.depart_count >= p.avoid_exit_confirm_count:
-                    self.state.avoid_active = False
-                    self.state.depart_count = 0
-                    self.state.approach_count = 0
-            else:
-                self.state.depart_count = 0
-        
-        return self.state.avoid_active
+            self.approach_count = 0
+        return False
     
-    def _generate_command(
-        self,
-        avoid: bool,
-        d0: float,
-        d0_deriv: float
-    ) -> ControlCommand:
-        """Generate velocity command based on current mode."""
+    def _should_exit_avoid(self) -> bool:
+        """Check if peer is far enough and we should exit AVOID state."""
         p = self.params
+        peer_dist = self.ctx.peer_dist
         
-        if avoid:
-            # Avoidance: fly forward with evasive yaw
-            yaw_rate = self._get_avoid_yaw_rate()
-            return ControlCommand(
-                vx_body=p.fwd_speed_mps * p.avoid_speed_factor,
-                vy_body=0.0,
-                yaw_rate=yaw_rate
-            )
+        if peer_dist >= p.peer_close_m:
+            self.depart_count += 1
+            if self.depart_count >= p.avoid_exit_confirm_count:
+                self.depart_count = 0
+                self.approach_count = 0
+                return True
+        else:
+            self.depart_count = 0
+        return False
+    
+    # =========================================================================
+    # State machine: on_enter handlers
+    # =========================================================================
+    
+    def _on_enter_state(self, state: FlightState, current_yaw: float = 0.0) -> None:
+        """Called when entering a state."""
+        if state == FlightState.STRAIGHT:
+            self._on_enter_straight()
+        elif state == FlightState.TURN:
+            self._on_enter_turn(current_yaw)
+        elif state == FlightState.AVOID:
+            self._on_enter_avoid()
+        elif state == FlightState.RECOVER:
+            self._on_enter_recover()
+    
+    def _on_enter_straight(self) -> None:
+        """Enter STRAIGHT state."""
+        self.inner_over_count = 0
+    
+    def _on_enter_turn(self, current_yaw: float) -> None:
+        """Enter TURN state."""
+        self.inner_under_count = 0
+        self.ctx.arc_yaw_start = current_yaw
+        self.ctx.target_yaw = self._normalize_angle(current_yaw - 90.0)
+        self.ctx.arc_active = math.isfinite(current_yaw)
+    
+    def _on_enter_avoid(self) -> None:
+        """Enter AVOID state."""
+        pass  # Nothing special in C
+    
+    def _on_enter_recover(self) -> None:
+        """Enter RECOVER state."""
+        pass  # Nothing special in C
+    
+    # =========================================================================
+    # State machine: on_exit handlers
+    # =========================================================================
+    
+    def _on_exit_state(self, state: FlightState) -> None:
+        """Called when exiting a state."""
+        if state == FlightState.STRAIGHT:
+            self._on_exit_straight()
+        elif state == FlightState.TURN:
+            self._on_exit_turn()
+        elif state == FlightState.AVOID:
+            self._on_exit_avoid()
+        elif state == FlightState.RECOVER:
+            self._on_exit_recover()
+    
+    def _on_exit_straight(self) -> None:
+        """Exit STRAIGHT state."""
+        pass  # Nothing special in C
+    
+    def _on_exit_turn(self) -> None:
+        """Exit TURN state."""
+        self.ctx.arc_active = False
+    
+    def _on_exit_avoid(self) -> None:
+        """Exit AVOID state."""
+        self.approach_count = 0
+        self.depart_count = 0
+    
+    def _on_exit_recover(self) -> None:
+        """Exit RECOVER state."""
+        pass  # Nothing special in C
+    
+    # =========================================================================
+    # State machine: check_transition handlers
+    # =========================================================================
+    
+    def _check_transition(self, state: FlightState, current_yaw: float) -> FlightState:
+        """Check for state transitions."""
+        if state == FlightState.STRAIGHT:
+            return self._check_transition_straight()
+        elif state == FlightState.TURN:
+            return self._check_transition_turn(current_yaw)
+        elif state == FlightState.AVOID:
+            return self._check_transition_avoid()
+        elif state == FlightState.RECOVER:
+            return self._check_transition_recover()
+        return state
+    
+    def _check_transition_straight(self) -> FlightState:
+        """Check transitions from STRAIGHT state."""
+        p = self.params
+        ctx = self.ctx
         
-        elif self.state.mode == FlightMode.STRAIGHT:
-            return ControlCommand(
-                vx_body=p.fwd_speed_mps,
-                vy_body=0.0,
-                yaw_rate=0.0
-            )
+        # STRAIGHT -> AVOID: peer too close
+        if self._should_enter_avoid():
+            return FlightState.AVOID
         
-        elif self.state.mode == FlightMode.RECOVER:
-            # Yaw rate based on derivative error
-            yaw_cmd = self.recover_factor * abs(d0_deriv - p.des_deriv_mps)
-            if yaw_cmd <= p.recover_deadzone_dps:
-                yaw_cmd = 0.0
-            return ControlCommand(
-                vx_body=p.fwd_speed_mps,
-                vy_body=0.0,
-                yaw_rate=yaw_cmd
-            )
+        # STRAIGHT -> TURN: reached outer bound (only if not in arc cooldown)
+        if ctx.d0 >= p.inner_bound_m and not ctx.arc_cooldown:
+            self.inner_over_count += 1
+            if self.inner_over_count >= p.abort_confirm_count:
+                return FlightState.TURN
+        elif ctx.d0 < p.inner_bound_m:
+            self.inner_over_count = 0
         
-        else:  # TURN mode
-            return ControlCommand(
-                vx_body=p.fwd_speed_mps,
-                vy_body=0.0,
-                yaw_rate=p.turn_yaw_rate_dps
-            )
+        # STRAIGHT -> RECOVER: outside inner bound and moving away from beacon (during cooldown)
+        if ctx.d0 >= p.inner_bound_m and ctx.d0_deriv > 0 and ctx.arc_cooldown:
+            return FlightState.RECOVER
+        
+        return FlightState.STRAIGHT
+    
+    def _check_transition_turn(self, current_yaw: float) -> FlightState:
+        """Check transitions from TURN state."""
+        p = self.params
+        ctx = self.ctx
+        
+        # TURN -> AVOID: peer too close
+        if self._should_enter_avoid():
+            return FlightState.AVOID
+        
+        # TURN -> STRAIGHT: back inside inner bound
+        if ctx.d0 <= p.inner_bound_m:
+            self.inner_under_count += 1
+            if self.inner_under_count >= p.abort_confirm_count:
+                ctx.routines += 1
+                return FlightState.STRAIGHT
+        else:
+            self.inner_under_count = 0
+        
+        # Arc tracking: when 90° reached, decide STRAIGHT or RECOVER
+        if ctx.arc_active and math.isfinite(current_yaw):
+            yaw_diff = abs(current_yaw - ctx.target_yaw)
+            # Handle wrap-around
+            if yaw_diff > 180:
+                yaw_diff = 360 - yaw_diff
+            
+            reached = yaw_diff <= 3.0
+            if reached:
+                ctx.arc_active = False
+                ctx.arc_cooldown = True
+                if ctx.d0_deriv <= 0:
+                    return FlightState.STRAIGHT
+                else:
+                    return FlightState.RECOVER
+        elif ctx.arc_active:
+            ctx.arc_active = False  # Yaw unavailable
+        
+        return FlightState.TURN
+    
+    def _check_transition_avoid(self) -> FlightState:
+        """Check transitions from AVOID state."""
+        p = self.params
+        ctx = self.ctx
+        
+        # AVOID -> STRAIGHT or RECOVER: peer far enough
+        if self._should_exit_avoid():
+            if ctx.d0 < p.inner_bound_m:
+                return FlightState.STRAIGHT
+            else:
+                return FlightState.RECOVER
+        
+        return FlightState.AVOID
+    
+    def _check_transition_recover(self) -> FlightState:
+        """Check transitions from RECOVER state."""
+        p = self.params
+        ctx = self.ctx
+        
+        # RECOVER -> AVOID: peer too close
+        if self._should_enter_avoid():
+            return FlightState.AVOID
+        
+        # RECOVER -> STRAIGHT: back inside inner bound
+        if ctx.d0 > 0 and ctx.d0 <= p.inner_bound_m:
+            return FlightState.STRAIGHT
+        
+        return FlightState.RECOVER
+    
+    # =========================================================================
+    # State machine: execute handlers
+    # =========================================================================
+    
+    def _execute_state(self, state: FlightState) -> ControlCommand:
+        """Execute current state and return command."""
+        if state == FlightState.STRAIGHT:
+            return self._execute_straight()
+        elif state == FlightState.TURN:
+            return self._execute_turn()
+        elif state == FlightState.AVOID:
+            return self._execute_avoid()
+        elif state == FlightState.RECOVER:
+            return self._execute_recover()
+        return ControlCommand()
+    
+    def _execute_straight(self) -> ControlCommand:
+        """Execute STRAIGHT state."""
+        return ControlCommand(
+            vx_body=self.params.fwd_speed_mps,
+            vy_body=0.0,
+            yaw_rate=0.0
+        )
+    
+    def _execute_turn(self) -> ControlCommand:
+        """Execute TURN state."""
+        return ControlCommand(
+            vx_body=self.params.fwd_speed_mps,
+            vy_body=0.0,
+            yaw_rate=self.params.turn_yaw_rate_dps
+        )
+    
+    def _execute_avoid(self) -> ControlCommand:
+        """Execute AVOID state."""
+        return ControlCommand(
+            vx_body=self.params.fwd_speed_mps * self.params.avoid_speed_factor,
+            vy_body=0.0,
+            yaw_rate=self._get_avoid_yaw_rate()
+        )
+    
+    def _execute_recover(self) -> ControlCommand:
+        """Execute RECOVER state."""
+        p = self.params
+        ctx = self.ctx
+        
+        # Yaw rate based on derivative error (matching C code)
+        # yawCommand = recoverFactor * fabsf(ctx.d0Deriv - DES_DERIV)
+        yaw_cmd = self.recover_factor * abs(ctx.d0_deriv - p.des_deriv_mps)
+        
+        # Apply deadzone
+        if yaw_cmd <= p.recover_deadzone_dps:
+            yaw_cmd = 0.0
+        
+        return ControlCommand(
+            vx_body=p.fwd_speed_mps,
+            vy_body=0.0,
+            yaw_rate=yaw_cmd
+        )
+    
+    # =========================================================================
+    # Helper methods
+    # =========================================================================
     
     def _get_avoid_yaw_rate(self) -> float:
         """Get avoidance yaw rate based on drone ID."""
@@ -394,12 +562,20 @@ class SwarmController:
             angle += 360
         return angle
     
+    # =========================================================================
+    # Properties for external access
+    # =========================================================================
+    
     @property
-    def mode(self) -> FlightMode:
-        """Get current flight mode."""
-        return self.state.mode
+    def mode(self) -> FlightState:
+        """Get current flight state."""
+        return self.current_state
     
     @property
     def is_avoiding(self) -> bool:
-        """Check if avoidance is active."""
-        return self.state.avoid_active
+        """Check if currently in AVOID state."""
+        return self.current_state == FlightState.AVOID
+
+
+# Keep FlightMode as alias for backward compatibility with simulator
+FlightMode = FlightState

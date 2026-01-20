@@ -89,17 +89,27 @@ static logVarId_t idRangingAux2 = (logVarId_t)0xFFFF;  // UWB kill switch
 static logVarId_t idDistance1   = (logVarId_t)0xFFFF;  // distance to drone 1
 
 // ============================================================================
+// State machine
+// ============================================================================
+typedef enum {
+  STATE_STRAIGHT = 0,
+  STATE_TURN     = 1,
+  STATE_AVOID    = 2,
+  STATE_RECOVER  = 3
+} FlightState;
+
+static uint8_t currentState = STATE_STRAIGHT;  // Exposed for logging
+
+// ============================================================================
 // State variables
 // ============================================================================
 static uint8_t abortOverCount   = 0;
 static uint8_t innerOverCount   = 0;
 static uint8_t innerUnderCount  = 0;
 
-// Avoidance state
-static bool avoidActive = false;
+// Avoidance confirmation counters
 static uint8_t approachCount = 0;
 static uint8_t departCount = 0;
-static bool avoidWasActive = false;
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
@@ -293,42 +303,51 @@ static bool checkAndMaybeEmergencyLand(void) {
   return trigger;
 }
 
-static bool updateAvoidanceMode(void) {
+// Check if peer is too close and we should enter AVOID state
+// Returns true if should enter AVOID (with confirmation)
+static bool shouldEnterAvoid(void) {
   const uint32_t peerDist = getPeerDistance();
+  
+  if (peerDist > 0 && peerDist <= peerCloseMm) {
+    if (++approachCount >= avoidEnterConfirmCount) {
+      approachCount = 0;
+      departCount = 0;
+      return true;
+    }
+  } else {
+    approachCount = 0;
+  }
+  return false;
+}
 
-  // If already in avoidance and we get dangerously close, land immediately
-  if (avoidActive && peerDist > 0 && peerDist <= avoidMinLandMm) {
+// Check if peer is far enough and we should exit AVOID state
+// Returns true if should exit AVOID (with confirmation)
+static bool shouldExitAvoid(void) {
+  const uint32_t peerDist = getPeerDistance();
+  
+  if (peerDist >= peerCloseMm) {
+    if (++departCount >= avoidExitConfirmCount) {
+      departCount = 0;
+      approachCount = 0;
+      return true;
+    }
+  } else {
+    departCount = 0;
+  }
+  return false;
+}
+
+// Check for emergency land condition during AVOID
+static bool checkAvoidEmergencyLand(void) {
+  const uint32_t peerDist = getPeerDistance();
+  
+  if (currentState == STATE_AVOID && peerDist > 0 && peerDist <= avoidMinLandMm) {
     DEBUG_PRINT("AVOID EMERGENCY LAND: peer=%lu mm <= %u mm\n",
                 (unsigned long)peerDist, avoidMinLandMm);
     seqAbort = true;
     return true;
   }
-
-  if (!avoidActive) {
-    if (peerDist > 0 && peerDist <= peerCloseMm) {
-      if (++approachCount >= avoidEnterConfirmCount) {
-        avoidActive = true;
-        approachCount = 0;
-        departCount = 0;
-        DEBUG_PRINT("AVOID start: peer=%lu mm\n", (unsigned long)peerDist);
-      }
-    } else {
-      approachCount = 0;
-    }
-  } else {
-    if (peerDist >= peerCloseMm) {
-      if (++departCount >= avoidExitConfirmCount) {
-        avoidActive = false;
-        departCount = 0;
-        approachCount = 0;
-        DEBUG_PRINT("AVOID stop: peer=%lu mm\n", (unsigned long)peerDist);
-      }
-    } else {
-      departCount = 0;
-    }
-  }
-
-  return avoidActive;
+  return false;
 }
 
 // ============================================================================
@@ -377,19 +396,249 @@ static void rampToHeight(float zTarget, uint32_t rampMs) {
 }
 
 // ============================================================================
+// State machine context (shared between state handlers)
+// ============================================================================
+typedef struct {
+  // Arc tracking (TURN state)
+  bool arcActive;
+  bool arcCooldown;
+  float arcYawStart;
+  float targetYaw;
+  
+  // Counters
+  uint8_t routines;
+  
+  // Current sensor readings (updated each loop)
+  uint32_t d0;
+  float d0Deriv;
+} StateContext;
+
+static StateContext ctx;
+
+// ============================================================================
+// State handlers: onEnter, onExit, execute, checkTransition
+// ============================================================================
+
+// --- STRAIGHT state ---
+static void onEnterStraight(void) {
+  innerOverCount = 0;
+  DEBUG_PRINT("Enter STRAIGHT\n");
+}
+
+static void onExitStraight(void) {
+  // Nothing special to clean up
+}
+
+static FlightState checkTransitionStraight(void) {
+  // STRAIGHT -> AVOID: peer too close
+  if (shouldEnterAvoid()) {
+    DEBUG_PRINT("STRAIGHT -> AVOID: peer too close\n");
+    return STATE_AVOID;
+  }
+  
+  // STRAIGHT -> TURN: reached outer bound (only if not in arc cooldown)
+  if (ctx.d0 >= innerBoundMm && !ctx.arcCooldown) {
+    if (++innerOverCount >= abortConfirmCount) {
+      DEBUG_PRINT("STRAIGHT -> TURN (d0=%lu)\n", (unsigned long)ctx.d0);
+      return STATE_TURN;
+    }
+  } else if (ctx.d0 < innerBoundMm) {
+    innerOverCount = 0;
+  }
+  
+  // STRAIGHT -> RECOVER: outside inner bound and moving away from beacon
+  if (ctx.d0 >= innerBoundMm && ctx.d0Deriv > 0 && ctx.arcCooldown) {
+    DEBUG_PRINT("STRAIGHT -> RECOVER: outside bound and deriv=%.2f (moving away)\n", (double)ctx.d0Deriv);
+    return STATE_RECOVER;
+  }
+  
+  return STATE_STRAIGHT;  // No transition
+}
+
+static void executeStraight(void) {
+  sendHover(fwdSpeedMps, 0.0f, targetHeightM, 0.0f);
+}
+
+// --- TURN state ---
+static void onEnterTurn(void) {
+  innerUnderCount = 0;
+  ctx.arcYawStart = logGetFloat(idYaw);
+  ctx.targetYaw = normalizeAngle(ctx.arcYawStart - 90.0f);
+  ctx.arcActive = isfinite(ctx.arcYawStart);
+  DEBUG_PRINT("Enter TURN: arcActive=%d, startYaw=%.3f deg, targetYaw=%.3f deg\n",
+              ctx.arcActive ? 1 : 0, (double)ctx.arcYawStart, (double)ctx.targetYaw);
+}
+
+static void onExitTurn(void) {
+  ctx.arcActive = false;
+}
+
+static FlightState checkTransitionTurn(void) {
+  // TURN -> AVOID: peer too close (one way, cannot return to TURN)
+  if (shouldEnterAvoid()) {
+    DEBUG_PRINT("TURN -> AVOID: peer too close\n");
+    return STATE_AVOID;
+  }
+  
+  // TURN -> STRAIGHT: back inside inner bound
+  if (ctx.d0 <= innerBoundMm) {
+    if (++innerUnderCount >= abortConfirmCount) {
+      ctx.routines++;
+      DEBUG_PRINT("TURN -> STRAIGHT: routine %u complete (d0=%lu)\n", ctx.routines, (unsigned long)ctx.d0);
+      return STATE_STRAIGHT;
+    }
+  } else {
+    innerUnderCount = 0;
+  }
+  
+  // Arc tracking: when 270° reached, decide STRAIGHT or RECOVER
+  if (ctx.arcActive) {
+    float curYaw = logGetFloat(idYaw);
+    if (isfinite(curYaw)) {
+      const bool reached = (fabsf(curYaw - ctx.targetYaw) <= 3.0f) ||
+                           (fabsf(curYaw - ctx.targetYaw - 360.0f) <= 3.0f);
+      if (reached) {
+        ctx.arcActive = false;
+        ctx.arcCooldown = true;
+        if (ctx.d0Deriv <= 0) {
+          DEBUG_PRINT("TURN -> STRAIGHT: arc complete, deriv=%.2f (approaching)\n", (double)ctx.d0Deriv);
+          return STATE_STRAIGHT;
+        } else {
+          DEBUG_PRINT("TURN -> RECOVER: arc complete, deriv=%.2f (moving away)\n", (double)ctx.d0Deriv);
+          return STATE_RECOVER;
+        }
+      }
+    } else {
+      ctx.arcActive = false;
+      DEBUG_PRINT("TURN arc: yaw unavailable, stopping arc tracking\n");
+    }
+  }
+  
+  return STATE_TURN;  // No transition
+}
+
+static void executeTurn(void) {
+  sendHover(fwdSpeedMps, 0.0f, targetHeightM, turnYawRateDps);
+}
+
+// --- AVOID state ---
+static void onEnterAvoid(void) {
+  DEBUG_PRINT("Enter AVOID\n");
+}
+
+static void onExitAvoid(void) {
+  approachCount = 0;
+  departCount = 0;
+}
+
+static FlightState checkTransitionAvoid(void) {
+  // AVOID -> STRAIGHT or RECOVER: peer far enough
+  if (shouldExitAvoid()) {
+    if (ctx.d0 < innerBoundMm) {
+      DEBUG_PRINT("AVOID -> STRAIGHT: peer far, inside bound (d0=%lu)\n", (unsigned long)ctx.d0);
+      return STATE_STRAIGHT;
+    } else {
+      DEBUG_PRINT("AVOID -> RECOVER: peer far, outside bound (d0=%lu)\n", (unsigned long)ctx.d0);
+      return STATE_RECOVER;
+    }
+  }
+  
+  return STATE_AVOID;  // No transition
+}
+
+static void executeAvoid(void) {
+  sendHover(fwdSpeedMps * avoidSpeedFactor, 0.0f, targetHeightM, getAvoidYawRate());
+}
+
+// --- RECOVER state ---
+static void onEnterRecover(void) {
+  DEBUG_PRINT("Enter RECOVER\n");
+}
+
+static void onExitRecover(void) {
+  // Nothing special to clean up
+}
+
+static FlightState checkTransitionRecover(void) {
+  // RECOVER -> AVOID: peer too close
+  if (shouldEnterAvoid()) {
+    DEBUG_PRINT("RECOVER -> AVOID: peer too close\n");
+    return STATE_AVOID;
+  }
+  
+  // RECOVER -> STRAIGHT: back inside inner bound
+  if (ctx.d0 > 0 && ctx.d0 <= innerBoundMm) {
+    DEBUG_PRINT("RECOVER -> STRAIGHT: made it back to the circle (d0=%lu)\n", (unsigned long)ctx.d0);
+    return STATE_STRAIGHT;
+  }
+  
+  return STATE_RECOVER;  // No transition
+}
+
+static void executeRecover(void) {
+  float yawCommand = recoverFactor * fabsf(ctx.d0Deriv - DES_DERIV);
+  yawCommand = yawCommand > RECOVER_DEADZONE ? yawCommand : 0.0f;
+  sendHover(fwdSpeedMps, 0.0f, targetHeightM, yawCommand);
+}
+
+// ============================================================================
+// State machine dispatcher functions
+// ============================================================================
+static void onEnterState(FlightState state) {
+  switch (state) {
+    case STATE_STRAIGHT: onEnterStraight(); break;
+    case STATE_TURN:     onEnterTurn();     break;
+    case STATE_AVOID:    onEnterAvoid();    break;
+    case STATE_RECOVER:  onEnterRecover();  break;
+  }
+}
+
+static void onExitState(FlightState state) {
+  switch (state) {
+    case STATE_STRAIGHT: onExitStraight(); break;
+    case STATE_TURN:     onExitTurn();     break;
+    case STATE_AVOID:    onExitAvoid();    break;
+    case STATE_RECOVER:  onExitRecover();  break;
+  }
+}
+
+static FlightState checkTransition(FlightState state) {
+  switch (state) {
+    case STATE_STRAIGHT: return checkTransitionStraight();
+    case STATE_TURN:     return checkTransitionTurn();
+    case STATE_AVOID:    return checkTransitionAvoid();
+    case STATE_RECOVER:  return checkTransitionRecover();
+  }
+  return state;
+}
+
+static void executeState(FlightState state) {
+  switch (state) {
+    case STATE_STRAIGHT: executeStraight(); break;
+    case STATE_TURN:     executeTurn();     break;
+    case STATE_AVOID:    executeAvoid();    break;
+    case STATE_RECOVER:  executeRecover();  break;
+  }
+}
+
+// ============================================================================
 // Main flight sequence
 // ============================================================================
 static void runSequence(void) {
+  // Reset all state
   seqAbort = false;
   innerOverCount = innerUnderCount = 0;
-  uint8_t routines = 0;
-
-  bool arcActive = false;
-  bool arcCooldown = false;
-  float arcYawStart = 0.0f;
-  float target_yaw = 0.0f;
-
+  approachCount = departCount = 0;
+  
+  // Reset state context
+  memset(&ctx, 0, sizeof(ctx));
+  
+  // Reset derivative buffer
   d0BufferReset();
+  
+  // Initialize state machine
+  currentState = STATE_STRAIGHT;
+  onEnterState(currentState);
 
   uint32_t startTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
@@ -403,7 +652,6 @@ static void runSequence(void) {
   // Takeoff
   rampToHeight(targetHeightM, RAMP_TIME_MS);
 
-  enum { STRAIGHT = 0, TURN = 1, RECOVER = 2 } mode = STRAIGHT;
   const uint32_t dtMs = 20;
 
   while (!seqAbort) {
@@ -418,98 +666,34 @@ static void runSequence(void) {
     // Emergency checks (outer bound)
     if (checkAndMaybeEmergencyLand()) break;
 
-    // Read distance0
-    uint32_t d0 = logGetUint(idDistance0);
+    // Check for AVOID emergency (peer too close during AVOID)
+    if (checkAvoidEmergencyLand()) break;
 
-    // Add to derivative buffer
-    d0BufferAdd(d0, now);
-    float d0Deriv = d0BufferGetDerivative();
+    // Update context with current sensor readings
+    ctx.d0 = logGetUint(idDistance0);
+    d0BufferAdd(ctx.d0, now);
+    ctx.d0Deriv = d0BufferGetDerivative();
 
     // Clear arc cooldown once we re-enter the inner circle
-    if (arcCooldown && d0 > 0 && d0 <= innerBoundMm) {
-      arcCooldown = false;
-      DEBUG_PRINT("ARC cooldown cleared by inner re-entry (d0=%lu)\n", (unsigned long)d0);
+    if (ctx.arcCooldown && ctx.d0 > 0 && ctx.d0 <= innerBoundMm) {
+      ctx.arcCooldown = false;
+      DEBUG_PRINT("ARC cooldown cleared by inner re-entry (d0=%lu)\n", (unsigned long)ctx.d0);
     }
 
-    // Mode transitions with confirmation
-    if (mode == STRAIGHT) {
-      if (d0 >= innerBoundMm) {
-        if (!arcCooldown && (++innerOverCount >= abortConfirmCount)) {
-          mode = TURN;
-          innerOverCount = 0;
-          arcYawStart = logGetFloat(idYaw);
-          target_yaw = normalizeAngle(arcYawStart - 90.0f);
-          arcActive = isfinite(arcYawStart);
-          DEBUG_PRINT("ENTER TURN (d0=%lu), arcActive=%d, startYaw=%.3f deg\n",
-                      (unsigned long)d0, arcActive ? 1 : 0, (double)arcYawStart);
-        }
-      } else {
-        innerOverCount = 0;
-      }
-    } else if (mode == TURN) {
-      if (d0 <= innerBoundMm) {
-        if (++innerUnderCount >= abortConfirmCount) {
-          mode = STRAIGHT;
-          innerUnderCount = 0;
-          routines++;
-          DEBUG_PRINT("EXIT TURN -> routine %u complete (d0=%lu)\n", routines, (unsigned long)d0);
-        }
-      } else {
-        innerUnderCount = 0;
-      }
-    }
-
-    // Arc tracking: when 270° reached, stop yaw
-    if (mode == TURN && arcActive) {
-      float curYaw = logGetFloat(idYaw);
-      if (isfinite(curYaw)) {
-        const bool reached = (fabsf(curYaw - target_yaw) <= 3.0f) ||
-                             (fabsf(curYaw - target_yaw - 360.0f) <= 3.0f);
-        if (reached) {
-          DEBUG_PRINT("TURN arc reached 270° -> stop yaw\n");
-          mode = STRAIGHT;
-          arcActive = false;
-          arcCooldown = true;
-          innerUnderCount = 0;
-          if (d0Deriv > 0) {
-            DEBUG_PRINT("However, derivative was %.2f so going into recovery mode\n", (double)d0Deriv);
-            mode = RECOVER;
-          }
-        }
-      } else {
-        arcActive = false;
-        DEBUG_PRINT("TURN arc: yaw unavailable, stopping arc tracking\n");
-      }
-    }
-
-    // Avoidance overrides the normal command
-    avoidWasActive = avoidActive;
-    const bool avoid = updateAvoidanceMode();
-
-    if ((avoidWasActive && !avoid) && (d0 >= innerBoundMm)) {
-      mode = RECOVER;
+    // ========================================================================
+    // State machine: check transitions and execute current state
+    // ========================================================================
+    FlightState nextState = checkTransition(currentState);
+    
+    if (nextState != currentState) {
+      onExitState(currentState);
+      currentState = nextState;
+      onEnterState(currentState);
     }
 
     if (seqAbort) break;
 
-    // Send commands based on mode
-    if (avoid) {
-      sendHover(fwdSpeedMps * avoidSpeedFactor, 0.0f, targetHeightM, getAvoidYawRate());
-    } else if (mode == STRAIGHT) {
-      sendHover(fwdSpeedMps, 0.0f, targetHeightM, 0.0f);
-    } else if (mode == RECOVER) {
-      float yawCommand = recoverFactor * fabsf(d0Deriv - DES_DERIV);
-      yawCommand = yawCommand > RECOVER_DEADZONE ? yawCommand : 0.0f;
-      sendHover(fwdSpeedMps, 0.0f, targetHeightM, yawCommand);
-      DEBUG_PRINT("Recovering with yawrate %.2f deg/s for deriv %.2f\n", (double)yawCommand, (double)d0Deriv);
-      if (d0 > 0 && d0 <= innerBoundMm) {
-        mode = STRAIGHT;
-        DEBUG_PRINT("Made it back to the circle!\n");
-      }
-    } else {
-      // TURN mode
-      sendHover(fwdSpeedMps, 0.0f, targetHeightM, turnYawRateDps);
-    }
+    executeState(currentState);
 
     vTaskDelay(pdMS_TO_TICKS(dtMs));
   }
@@ -518,7 +702,7 @@ static void runSequence(void) {
   if (seqAbort) {
     DEBUG_PRINT("Emergency landing\n");
   } else {
-    DEBUG_PRINT("Finished demo in approx %u routines\n", routines);
+    DEBUG_PRINT("Finished demo in approx %u routines\n", ctx.routines);
   }
 }
 
@@ -594,37 +778,40 @@ void appMain(void) {
     }
     DEBUG_PRINT("Drone 1: RC trigger (cppm.aux0<%d), avoid on distance2<=%u (CW)\n",
       AUX_RC_ACTIVE_THRESH, peerCloseMm);
-    } else {
-      // Drone 2+: UWB trigger/kill and distance to drone 1
-      while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idRangingAux2) ||
-      !logVarIdIsValid(idDistance1)) {
-        ensureLogId(&idRangingAux1, "ranging", "aux1");
-        ensureLogId(&idRangingAux2, "ranging", "aux2");
-        ensureLogId(&idDistance1,   "ranging", "distance1");
-        vTaskDelay(pdMS_TO_TICKS(100));
-      }
-      DEBUG_PRINT("Drone %u: UWB trigger (ranging.aux1>%u), kill (ranging.aux2), avoid on distance1<=%u (CCW)\n",
-        droneId, AUX_UWB_ACTIVE_THRESHOLD, peerCloseMm);
+  } else {
+    // Drone 2+: UWB trigger/kill and distance to drone 1
+    while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idRangingAux2) ||
+    !logVarIdIsValid(idDistance1)) {
+      ensureLogId(&idRangingAux1, "ranging", "aux1");
+      ensureLogId(&idRangingAux2, "ranging", "aux2");
+      ensureLogId(&idDistance1,   "ranging", "distance1");
+      vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    DEBUG_PRINT("Drone %u: UWB trigger (ranging.aux1>%u), kill (ranging.aux2), avoid on distance1<=%u (CCW)\n",
+      droneId, AUX_UWB_ACTIVE_THRESHOLD, peerCloseMm);
+  }
+      
+  bool wasActive = false;
+
+  if (droneId != 0) {
+    while (1) {
+      const bool active = isTriggerActive();
+  
+      // Emergency always active, even when idle
+      if (checkAndMaybeEmergencyLand()) {
+        landToZero();
       }
       
-      bool wasActive = false;
-      while (1) {
-        const bool active = isTriggerActive();
-
-    // Emergency always active, even when idle
-    if (checkAndMaybeEmergencyLand()) {
-      landToZero();
+      // On rising edge of trigger, run the sequence
+      if (active && !wasActive) {
+        // Set velocity controller gains to ensure consistent behavior
+        setVelocityControllerGains();
+        runSequence();
+      }
+      
+      wasActive = active;
+      vTaskDelay(pdMS_TO_TICKS(20));
     }
-    
-    // On rising edge of trigger, run the sequence
-    if (active && !wasActive) {
-      // Set velocity controller gains to ensure consistent behavior
-      setVelocityControllerGains();
-      runSequence();
-    }
-    
-    wasActive = active;
-    vTaskDelay(pdMS_TO_TICKS(20));
   }
 }
 
@@ -646,3 +833,11 @@ PARAM_GROUP_START(swarm)
   PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, avoidYawRate, &avoidYawRateMagnitude)
   PARAM_ADD(PARAM_UINT32 | PARAM_PERSISTENT, demoTime, &demoTimeMs)
 PARAM_GROUP_STOP(swarm)
+
+// ============================================================================
+// Log definitions (for monitoring state)
+// State values: 0=STRAIGHT, 1=TURN, 2=AVOID, 3=RECOVER
+// ============================================================================
+LOG_GROUP_START(swarm)
+  LOG_ADD(LOG_UINT8, state, &currentState)
+LOG_GROUP_STOP(swarm)
