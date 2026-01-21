@@ -71,6 +71,9 @@ static uint32_t demoTimeMs = 60000U;         // time of the demo in ms
 // Drone 2+ specific: UWB trigger threshold (active high)
 #define AUX_UWB_ACTIVE_THRESHOLD 0U
 
+// Height threshold below which we consider a drone "landed" (meters)
+#define PEER_LANDED_HEIGHT_M 0.10f
+
 // ============================================================================
 // Log variable IDs
 // ============================================================================
@@ -82,11 +85,13 @@ static logVarId_t idYaw         = (logVarId_t)0xFFFF;
 // Drone 1 specific
 static logVarId_t idCppmAux0    = (logVarId_t)0xFFFF;  // RC trigger
 static logVarId_t idDistance2   = (logVarId_t)0xFFFF;  // distance to drone 2
+static logVarId_t idHeight2     = (logVarId_t)0xFFFF;  // height of drone 2
 
 // Drone 2+ specific (triggered via UWB)
 static logVarId_t idRangingAux1 = (logVarId_t)0xFFFF;  // UWB trigger
 static logVarId_t idRangingAux2 = (logVarId_t)0xFFFF;  // UWB kill switch
 static logVarId_t idDistance1   = (logVarId_t)0xFFFF;  // distance to drone 1
+static logVarId_t idHeight1     = (logVarId_t)0xFFFF;  // height of drone 1
 
 // ============================================================================
 // State machine
@@ -238,6 +243,21 @@ static inline uint32_t getPeerDistance(void) {
   }
 }
 
+// Get the height of the peer drone (for avoidance)
+static inline float getPeerHeight(void) {
+  if (droneId == 1) {
+    return logGetFloat(idHeight2);  // Drone 1 watches drone 2
+  } else {
+    return logGetFloat(idHeight1);  // Drone 2 watches drone 1
+  }
+}
+
+// Check if the peer drone has landed (z < threshold)
+static inline bool isPeerLanded(void) {
+  float peerHeight = getPeerHeight();
+  return (peerHeight >= 0.0f && peerHeight < PEER_LANDED_HEIGHT_M);
+}
+
 // Get the avoidance yaw rate (sign depends on drone)
 static inline float getAvoidYawRate(void) {
   if (droneId == 1) {
@@ -307,6 +327,12 @@ static bool checkAndMaybeEmergencyLand(void) {
 // Returns true if should enter AVOID (with confirmation)
 static bool shouldEnterAvoid(void) {
   const uint32_t peerDist = getPeerDistance();
+  
+  // Don't enter avoid if peer has landed (z < threshold)
+  if (isPeerLanded()) {
+    approachCount = 0;  // Reset counter since we're not tracking
+    return false;
+  }
   
   if (peerDist > 0 && peerDist <= peerCloseMm) {
     if (++approachCount >= avoidEnterConfirmCount) {
@@ -779,21 +805,23 @@ void appMain(void) {
   
   // Drone-specific IDs
   if (droneId == 1) {
-    // Drone 1: RC trigger and distance to drone 2
-    while (!logVarIdIsValid(idCppmAux0) || !logVarIdIsValid(idDistance2)) {
+    // Drone 1: RC trigger and distance/height to drone 2
+    while (!logVarIdIsValid(idCppmAux0) || !logVarIdIsValid(idDistance2) || !logVarIdIsValid(idHeight2)) {
       ensureLogId(&idCppmAux0,   "cppm", "aux0");
       ensureLogId(&idDistance2,  "ranging", "distance2");
+      ensureLogId(&idHeight2,    "ranging", "height2");
       vTaskDelay(pdMS_TO_TICKS(100));
     }
     DEBUG_PRINT("Drone 1: RC trigger (cppm.aux0<%d), avoid on distance2<=%u (CW)\n",
       AUX_RC_ACTIVE_THRESH, peerCloseMm);
   } else {
-    // Drone 2+: UWB trigger/kill and distance to drone 1
+    // Drone 2+: UWB trigger/kill and distance/height to drone 1
     while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idRangingAux2) ||
-    !logVarIdIsValid(idDistance1)) {
+           !logVarIdIsValid(idDistance1) || !logVarIdIsValid(idHeight1)) {
       ensureLogId(&idRangingAux1, "ranging", "aux1");
       ensureLogId(&idRangingAux2, "ranging", "aux2");
       ensureLogId(&idDistance1,   "ranging", "distance1");
+      ensureLogId(&idHeight1,     "ranging", "height1");
       vTaskDelay(pdMS_TO_TICKS(100));
     }
     DEBUG_PRINT("Drone %u: UWB trigger (ranging.aux1>%u), kill (ranging.aux2), avoid on distance1<=%u (CCW)\n",
