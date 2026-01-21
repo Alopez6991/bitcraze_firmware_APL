@@ -351,6 +351,13 @@ static bool shouldEnterAvoid(void) {
 static bool shouldExitAvoid(void) {
   const uint32_t peerDist = getPeerDistance();
   
+  // Exit avoid immediately if peer has landed (no collision risk)
+  if (isPeerLanded()) {
+    departCount = 0;
+    approachCount = 0;
+    return true;
+  }
+  
   if (peerDist >= peerCloseMm) {
     if (++departCount >= avoidExitConfirmCount) {
       departCount = 0;
