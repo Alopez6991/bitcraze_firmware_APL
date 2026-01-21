@@ -238,7 +238,7 @@ default_config = Config(
     # -------------------------------------------------------------------------
     drone1=DroneConfig(
         initial=DroneInitialState(
-            x=1.2842,
+            x=2.1,
             y=-1.4800,
             z=1.0,  # Flying altitude (meters)
             yaw=-20.9322,
@@ -265,7 +265,7 @@ default_config = Config(
             x=-0.5853,
             y=0.1837,
             z=1.0,  # Flying altitude (meters)
-            yaw=2.2283,
+            yaw=-10.2283,
         ),
         noise=DroneNoiseParams(
             enable_process_noise=False,

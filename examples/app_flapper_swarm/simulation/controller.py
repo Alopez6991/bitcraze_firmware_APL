@@ -58,6 +58,7 @@ class StateContext:
     d0_deriv: float = 0.0  # Derivative of d0 (m/s)
     peer_dist: float = 0.0  # Distance to peer drone (meters)
     peer_dist_deriv: float = 0.0  # Derivative of peer distance (m/s, negative = closing)
+    peer_z: float = 1.0  # Peer drone's z-height (meters), default to flying height
 
 
 class DerivativeEstimator:
@@ -188,7 +189,6 @@ class SwarmController:
         
         # Compute recover factor (matching C code: recoverFactor = -(RECOVER_YAWRATE / DES_DERIV))
         self.recover_factor = -(params.recover_yaw_rate_dps / params.des_deriv_mps)
-    
     def reset(self) -> None:
         """Reset controller state."""
         self.current_state = FlightState.STRAIGHT
@@ -209,7 +209,8 @@ class SwarmController:
         d0: float,  # Distance to beacon (meters)
         peer_dist: float,  # Distance to peer drone (meters)
         current_yaw: float,  # Current heading (degrees)
-        time: float  # Current simulation time (seconds)
+        time: float,  # Current simulation time (seconds)
+        peer_z: float = 1.0  # Peer drone's z-height (meters)
     ) -> Tuple[ControlCommand, bool]:
         """
         Update controller and get command.
@@ -233,6 +234,7 @@ class SwarmController:
         self.ctx.d0 = d0
         self.ctx.d0_deriv = self.d0_deriv.get_derivative()
         self.ctx.peer_dist = peer_dist
+        self.ctx.peer_z = peer_z  # Store peer z-height
         self.ctx.peer_dist_deriv = self.peer_dist_deriv.get_derivative()
         
         # Check emergency conditions
@@ -292,6 +294,11 @@ class SwarmController:
         """Check if peer is too close and we should enter AVOID state."""
         p = self.params
         peer_dist = self.ctx.peer_dist
+        peer_z = self.ctx.peer_z
+        
+        # Don't enter avoid if peer has landed (z < 0.1m)
+        if peer_z < 0.1:
+            return False
         
         if peer_dist > 0 and peer_dist <= p.peer_close_m:
             # print(self.ctx.peer_dist_deriv)

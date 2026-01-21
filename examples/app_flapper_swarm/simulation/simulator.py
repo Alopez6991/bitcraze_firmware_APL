@@ -325,12 +325,16 @@ class Simulator:
             measured_d0 = uwb.measure(true_d0)
             measured_peer_dist = uwb.measure(true_peer_dist) #if true_peer_dist != float('inf') else float('inf')
             
+            # Get peer drone's z-height
+            peer_z = other_drone.state.z
+            
             # Get control command using MEASURED (noisy) distances
             cmd, emergency_reason = ctrl.update(
                 d0=measured_d0,
                 peer_dist=measured_peer_dist,
                 current_yaw=drone.yaw,
-                time=self.time
+                time=self.time,
+                peer_z=peer_z
             )
             
             if emergency_reason != LandingReason.NONE:
@@ -401,12 +405,16 @@ class Simulator:
             measured_d0 = uwb.measure(true_d0)
             measured_peer_dist = uwb.measure(true_peer_dist) if true_peer_dist != float('inf') else float('inf')
             
+            # Get peer drone's z-height
+            peer_z = other_drone.state.z
+            
             # Get control command using MEASURED (noisy) distances
             cmd, emergency_reason = ctrl.update(
                 d0=measured_d0,
                 peer_dist=measured_peer_dist,
                 current_yaw=drone.yaw,
-                time=self.time
+                time=self.time,
+                peer_z=peer_z
             )
             
             if emergency_reason != LandingReason.NONE:
