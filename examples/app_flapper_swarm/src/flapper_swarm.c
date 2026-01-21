@@ -72,7 +72,7 @@ static uint32_t demoTimeMs = 60000U;         // time of the demo in ms
 #define AUX_UWB_ACTIVE_THRESHOLD 0U
 
 // Height threshold below which we consider a drone "landed" (meters)
-#define PEER_LANDED_HEIGHT_M 0.10f
+#define PEER_LANDED_HEIGHT_M 100.0f
 
 // ============================================================================
 // Log variable IDs
