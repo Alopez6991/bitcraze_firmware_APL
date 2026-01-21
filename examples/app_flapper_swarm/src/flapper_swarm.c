@@ -404,6 +404,7 @@ typedef struct {
   bool arcCooldown;
   float arcYawStart;
   float targetYaw;
+  int rotationDirection;
   
   // Counters
   uint8_t routines;
@@ -552,11 +553,17 @@ static void executeAvoid(void) {
 
 // --- RECOVER state ---
 static void onEnterRecover(void) {
+  if (droneId != 1) {
+    if (ctx.d0 > dist0AbortMm - 800) { // subject to tuning
+      DEBUG_PRINT("Keeping direction after avoid\n");
+      ctx.rotationDirection = -1;
+    }
+  }
   DEBUG_PRINT("Enter RECOVER\n");
 }
 
 static void onExitRecover(void) {
-  // Nothing special to clean up
+  ctx.rotationDirection = 1;
 }
 
 static FlightState checkTransitionRecover(void) {
@@ -578,6 +585,7 @@ static FlightState checkTransitionRecover(void) {
 static void executeRecover(void) {
   float yawCommand = recoverFactor * fabsf(ctx.d0Deriv - DES_DERIV);
   yawCommand = yawCommand > RECOVER_DEADZONE ? yawCommand : 0.0f;
+  yawCommand *= ctx.rotationDirection;
   sendHover(fwdSpeedMps, 0.0f, targetHeightM, yawCommand);
 }
 
@@ -632,6 +640,7 @@ static void runSequence(void) {
   
   // Reset state context
   memset(&ctx, 0, sizeof(ctx));
+  ctx.rotationDirection = 1;
   
   // Reset derivative buffer
   d0BufferReset();
