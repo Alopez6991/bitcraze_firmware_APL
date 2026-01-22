@@ -100,10 +100,12 @@ typedef enum {
   STATE_STRAIGHT = 0,
   STATE_TURN     = 1,
   STATE_AVOID    = 2,
-  STATE_RECOVER  = 3
+  STATE_RECOVER  = 3,
+  STATE_DANCE    = 4
 } FlightState;
 
 static uint8_t currentState = STATE_STRAIGHT;  // Exposed for logging
+static FlightState prevState = STATE_STRAIGHT; // Track previous state for transitions
 
 // ============================================================================
 // State variables
@@ -115,6 +117,19 @@ static uint8_t innerUnderCount  = 0;
 // Avoidance confirmation counters
 static uint8_t approachCount = 0;
 static uint8_t departCount = 0;
+
+// Dance state counters
+static uint8_t peerLandedCount = 0;
+static uint8_t rejoinCount = 0;
+
+// Dance state constants
+#define PEER_LANDED_CONFIRM_COUNT 3
+#define REJOIN_EXTRA_MM 50U
+#define REJOIN_CONFIRM_COUNT 3
+
+// Dance state tracking
+static bool danceHasLanded = false;  // Drone 1: tracks if we've completed landing
+static bool danceHasTakenOff = false; // Drone 1: tracks if we've completed takeoff
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
@@ -370,17 +385,11 @@ static bool shouldExitAvoid(void) {
   return false;
 }
 
-// Check for emergency land condition during AVOID
-static bool checkAvoidEmergencyLand(void) {
+// Check if we should enter DANCE state (peer dangerously close during AVOID)
+// This replaces the old checkAvoidEmergencyLand() behavior
+static bool shouldEnterDance(void) {
   const uint32_t peerDist = getPeerDistance();
-  
-  if (currentState == STATE_AVOID && peerDist > 0 && peerDist <= avoidMinLandMm) {
-    DEBUG_PRINT("AVOID EMERGENCY LAND: peer=%lu mm <= %u mm\n",
-                (unsigned long)peerDist, avoidMinLandMm);
-    seqAbort = true;
-    return true;
-  }
-  return false;
+  return (currentState == STATE_AVOID && peerDist > 0 && peerDist <= avoidMinLandMm);
 }
 
 // ============================================================================
@@ -457,6 +466,11 @@ static StateContext ctx;
 static void onEnterStraight(void) {
   innerOverCount = 0;
   DEBUG_PRINT("Enter STRAIGHT\n");
+  
+  // If we just came from DANCE state (drone 1 after takeoff), log it
+  if (prevState == STATE_DANCE && droneId == 1) {
+    DEBUG_PRINT("STRAIGHT: rejoined swarm after DANCE\n");
+  }
 }
 
 static void onExitStraight(void) {
@@ -558,14 +572,23 @@ static void executeTurn(void) {
 // --- AVOID state ---
 static void onEnterAvoid(void) {
   DEBUG_PRINT("Enter AVOID\n");
+  peerLandedCount = 0;
 }
 
 static void onExitAvoid(void) {
   approachCount = 0;
   departCount = 0;
+  peerLandedCount = 0;
 }
 
 static FlightState checkTransitionAvoid(void) {
+  // AVOID -> DANCE: peer dangerously close (emergency zone)
+  if (shouldEnterDance()) {
+    DEBUG_PRINT("AVOID -> DANCE: peer in danger zone (dist=%lu <= %u)\n",
+                (unsigned long)getPeerDistance(), avoidMinLandMm);
+    return STATE_DANCE;
+  }
+  
   // AVOID -> STRAIGHT or RECOVER: peer far enough
   if (shouldExitAvoid()) {
     if (ctx.d0 < innerBoundMm) {
@@ -622,6 +645,102 @@ static void executeRecover(void) {
   sendHover(fwdSpeedMps, 0.0f, targetHeightM, yawCommand);
 }
 
+// --- DANCE state ---
+static void onEnterDance(void) {
+  DEBUG_PRINT("Enter DANCE (drone %u)\n", droneId);
+  peerLandedCount = 0;
+  rejoinCount = 0;
+  danceHasLanded = false;
+  danceHasTakenOff = false;
+}
+
+static void onExitDance(void) {
+  DEBUG_PRINT("Exit DANCE (drone %u)\n", droneId);
+  peerLandedCount = 0;
+  rejoinCount = 0;
+  danceHasLanded = false;
+  danceHasTakenOff = false;
+}
+
+static FlightState checkTransitionDance(void) {
+  if (droneId == 1) {
+    // Drone 1: Exit after we've landed AND taken off again
+    if (danceHasTakenOff) {
+      // Choose state based on current position
+      if (ctx.d0 < innerBoundMm) {
+        DEBUG_PRINT("DANCE -> STRAIGHT: drone 1 rejoining (d0=%lu)\n", (unsigned long)ctx.d0);
+        return STATE_STRAIGHT;
+      } else {
+        DEBUG_PRINT("DANCE -> RECOVER: drone 1 rejoining outside bound (d0=%lu)\n", (unsigned long)ctx.d0);
+        return STATE_RECOVER;
+      }
+    }
+  } else {
+    // Drone 2+: Exit once peer (drone 1) has landed
+    if (isPeerLanded()) {
+      if (peerLandedCount < 0xFF) peerLandedCount++;
+    } else {
+      peerLandedCount = 0;
+    }
+    
+    if (peerLandedCount >= PEER_LANDED_CONFIRM_COUNT) {
+      // Choose state based on current position
+      if (ctx.d0 < innerBoundMm) {
+        DEBUG_PRINT("DANCE -> STRAIGHT: drone %u exiting, peer landed (d0=%lu)\n", droneId, (unsigned long)ctx.d0);
+        return STATE_STRAIGHT;
+      } else {
+        DEBUG_PRINT("DANCE -> RECOVER: drone %u exiting, peer landed (d0=%lu)\n", droneId, (unsigned long)ctx.d0);
+        return STATE_RECOVER;
+      }
+    }
+  }
+  
+  return STATE_DANCE;  // No transition yet
+}
+
+static void executeDance(void) {
+  if (droneId == 1) {
+    // Drone 1: Land, wait for peer to be far enough, then take off
+    
+    if (!danceHasLanded) {
+      // Phase 1: Freeze and land
+      // First send freeze command, then perform landing
+      sendHover(0.0f, 0.0f, targetHeightM, 0.0f);  // Freeze momentarily
+      
+      DEBUG_PRINT("DANCE: drone 1 landing\n");
+      landToZero();
+      danceHasLanded = true;
+      DEBUG_PRINT("DANCE: drone 1 landed, waiting for peer to move away\n");
+      
+    } else if (!danceHasTakenOff) {
+      // Phase 2: Wait for peer to be far enough away, then take off
+      const uint32_t peerDist = getPeerDistance();
+      const uint32_t rejoinThresh = peerCloseMm + REJOIN_EXTRA_MM;
+      
+      if (peerDist >= rejoinThresh) {
+        if (rejoinCount < 0xFF) rejoinCount++;
+      } else {
+        rejoinCount = 0;
+      }
+      
+      if (rejoinCount >= REJOIN_CONFIRM_COUNT) {
+        DEBUG_PRINT("DANCE: drone 1 taking off (peer dist=%lu >= %lu)\n",
+                    (unsigned long)peerDist, (unsigned long)rejoinThresh);
+        rampToHeight(targetHeightM, RAMP_TIME_MS);
+        danceHasTakenOff = true;
+        DEBUG_PRINT("DANCE: drone 1 airborne, rejoining swarm\n");
+      }
+      // While waiting, do nothing (motors are off from landToZero)
+    }
+    // If danceHasTakenOff is true, checkTransitionDance will handle exit
+    
+  } else {
+    // Drone 2+: Just freeze and wait for peer to land
+    // checkTransitionDance handles the exit condition
+    sendHover(0.0f, 0.0f, targetHeightM, 0.0f);
+  }
+}
+
 // ============================================================================
 // State machine dispatcher functions
 // ============================================================================
@@ -631,6 +750,7 @@ static void onEnterState(FlightState state) {
     case STATE_TURN:     onEnterTurn();     break;
     case STATE_AVOID:    onEnterAvoid();    break;
     case STATE_RECOVER:  onEnterRecover();  break;
+    case STATE_DANCE:    onEnterDance();    break;
   }
 }
 
@@ -640,6 +760,7 @@ static void onExitState(FlightState state) {
     case STATE_TURN:     onExitTurn();     break;
     case STATE_AVOID:    onExitAvoid();    break;
     case STATE_RECOVER:  onExitRecover();  break;
+    case STATE_DANCE:    onExitDance();    break;
   }
 }
 
@@ -649,6 +770,7 @@ static FlightState checkTransition(FlightState state) {
     case STATE_TURN:     return checkTransitionTurn();
     case STATE_AVOID:    return checkTransitionAvoid();
     case STATE_RECOVER:  return checkTransitionRecover();
+    case STATE_DANCE:    return checkTransitionDance();
   }
   return state;
 }
@@ -659,6 +781,7 @@ static void executeState(FlightState state) {
     case STATE_TURN:     executeTurn();     break;
     case STATE_AVOID:    executeAvoid();    break;
     case STATE_RECOVER:  executeRecover();  break;
+    case STATE_DANCE:    executeDance();    break;
   }
 }
 
@@ -670,6 +793,8 @@ static void runSequence(void) {
   seqAbort = false;
   innerOverCount = innerUnderCount = 0;
   approachCount = departCount = 0;
+  peerLandedCount = 0;
+  rejoinCount = 0;
   
   // Reset state context
   memset(&ctx, 0, sizeof(ctx));
@@ -680,13 +805,14 @@ static void runSequence(void) {
   
   // Initialize state machine
   currentState = STATE_STRAIGHT;
+  prevState = STATE_STRAIGHT;
   onEnterState(currentState);
 
   uint32_t startTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
   const char* yawDir = (droneId == 1) ? "CW" : "CCW";
-  DEBUG_PRINT("Drone %u: fwd, TURN if d0>=%u; AVOID peer<=%u (%s yaw); land if d0>=%u\n",
-              droneId, innerBoundMm, peerCloseMm, yawDir, dist0AbortMm);
+  DEBUG_PRINT("Drone %u: fwd, TURN if d0>=%u; AVOID peer<=%u (%s yaw); DANCE if peer<=%u; land if d0>=%u\n",
+              droneId, innerBoundMm, peerCloseMm, yawDir, avoidMinLandMm, dist0AbortMm);
 
   // Kill check before takeoff (drone 2+ only)
   if (checkKillAndDisarm()) return;
@@ -705,11 +831,11 @@ static void runSequence(void) {
     // Kill check (drone 2+ only)
     if (checkKillAndDisarm()) break;
 
-    // Emergency checks (outer bound)
-    if (checkAndMaybeEmergencyLand()) break;
-
-    // Check for AVOID emergency (peer too close during AVOID)
-    if (checkAvoidEmergencyLand()) break;
+    // Emergency checks (outer bound) - but NOT during DANCE state for drone 1
+    // (drone 1 is landed and d0 reading might be invalid/stale)
+    if (currentState != STATE_DANCE || droneId != 1) {
+      if (checkAndMaybeEmergencyLand()) break;
+    }
 
     // Update context with current sensor readings
     ctx.d0 = logGetUint(idDistance0);
@@ -729,6 +855,7 @@ static void runSequence(void) {
     
     if (nextState != currentState) {
       onExitState(currentState);
+      prevState = currentState;
       currentState = nextState;
       onEnterState(currentState);
     }
@@ -880,7 +1007,7 @@ PARAM_GROUP_STOP(swarm)
 
 // ============================================================================
 // Log definitions (for monitoring state)
-// State values: 0=STRAIGHT, 1=TURN, 2=AVOID, 3=RECOVER
+// State values: 0=STRAIGHT, 1=TURN, 2=AVOID, 3=RECOVER, 4=DANCE
 // ============================================================================
 LOG_GROUP_START(swarm)
   LOG_ADD(LOG_UINT8, state, &currentState)
