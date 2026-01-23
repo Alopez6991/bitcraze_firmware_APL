@@ -244,10 +244,14 @@ static bool isTumbledCheck(SupervisorMem_t* this, const sensorData_t *data, cons
 
     const bool isUpSideDown = (data->acc.z < acceptedUpsideDownAccZ);
     if (isUpSideDown && (ticksBeingTumbled > maxUpsideDownTime)) {
+      DEBUG_PRINT("Tumbled upside down and exceeded time limit\n");
+      DEBUG_PRINT("ticks being tumbled for %u\n", (unsigned int)ticksBeingTumbled);
       return true;
     }
 
     if (ticksBeingTumbled > maxTiltTime) {
+      DEBUG_PRINT("Tumbled exceeded time limit\n");
+      DEBUG_PRINT("ticks being tumbled for %u\n", (unsigned int)ticksBeingTumbled);
       return true;
     }
   } else {

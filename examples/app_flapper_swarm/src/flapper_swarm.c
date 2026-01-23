@@ -82,6 +82,11 @@ static logVarId_t idDistance0   = (logVarId_t)0xFFFF;  // distance to beacon
 static logVarId_t idZ           = (logVarId_t)0xFFFF;
 static logVarId_t idYaw         = (logVarId_t)0xFFFF;
 
+// Debug: optic flow and z-ranger
+static logVarId_t idMotionDeltaX = (logVarId_t)0xFFFF;
+static logVarId_t idMotionDeltaY = (logVarId_t)0xFFFF;
+static logVarId_t idZrange       = (logVarId_t)0xFFFF;  // raw z-ranger reading (mm)
+
 // Drone 1 specific
 static logVarId_t idCppmAux0    = (logVarId_t)0xFFFF;  // RC trigger
 static logVarId_t idDistance2   = (logVarId_t)0xFFFF;  // distance to drone 2
@@ -842,6 +847,27 @@ static void runSequence(void) {
     d0BufferAdd(ctx.d0, now);
     ctx.d0Deriv = d0BufferGetDerivative();
 
+    // DEBUG: Check Z estimate, z-ranger, and optic flow
+    static uint8_t zDebugCounter = 0;
+    if (++zDebugCounter >= 50) {  // Every ~1 second
+      zDebugCounter = 0;
+      float z = logGetFloat(idZ);
+      uint16_t zrange = 0;
+      int16_t flowX = 0;
+      int16_t flowY = 0;
+      if (logVarIdIsValid(idZrange)) {
+        zrange = logGetUint(idZrange);
+      }
+      if (logVarIdIsValid(idMotionDeltaX)) {
+        flowX = logGetInt(idMotionDeltaX);
+      }
+      if (logVarIdIsValid(idMotionDeltaY)) {
+        flowY = logGetInt(idMotionDeltaY);
+      }
+      DEBUG_PRINT("State=%u Z=%.2f zrange=%u mm flowX=%d flowY=%d\n",
+                  currentState, (double)z, zrange, flowX, flowY);
+    }
+
     // Clear arc cooldown once we re-enter the inner circle
     if (ctx.arcCooldown && ctx.d0 > 0 && ctx.d0 <= innerBoundMm) {
       ctx.arcCooldown = false;
@@ -937,6 +963,11 @@ void appMain(void) {
     vTaskDelay(pdMS_TO_TICKS(100));
   }
   
+  // Debug: optic flow IDs (optional, don't block if unavailable)
+  ensureLogId(&idMotionDeltaX, "motion", "deltaX");
+  ensureLogId(&idMotionDeltaY, "motion", "deltaY");
+  ensureLogId(&idZrange,       "range", "zrange");
+
   // Drone-specific IDs
   if (droneId == 1) {
     // Drone 1: RC trigger and distance/height to drone 2
