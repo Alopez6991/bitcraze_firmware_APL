@@ -368,6 +368,7 @@ static const DeckDriver mtf02Deck = {
     .vid = 0,
     .pid = 0,
     .name = "bcMTF02",
+    .requiredEstimator = StateEstimatorTypeKalman,
 
     .usedGpio = 0,
     .usedPeriph = DECK_USING_UART1,

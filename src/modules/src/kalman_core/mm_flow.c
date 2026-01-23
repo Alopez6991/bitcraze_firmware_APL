@@ -25,6 +25,7 @@
 
 #include "mm_flow.h"
 #include "log.h"
+#include "debug.h"
 
 #define FLOW_RESOLUTION 0.10f //We do get the measurements in 10x the motion pixels (experimentally measured)
 
