@@ -508,3 +508,12 @@ config DECK_TEENSY
     default n
     help
         Enables the Teensy deck driver on UART1.
+
+config DECK_MTF02
+    bool "Support the MTF-02 optical flow and range sensor deck"
+    default n
+    help
+        Enables the MTF-02 deck driver from Micoair. The MTF-02 is a combined
+        optical flow and range (ToF) sensor that communicates over UART1.
+        It provides both flow velocity and distance measurements for use
+        with the Kalman filter estimator.
