@@ -270,9 +270,10 @@ static void processOpticalFlowMessage(msp_msg_t* msg, uint64_t* lastTime)
             flowData.dt = (float)(usecTimestamp() - *lastTime) / 1000000.0f;
             *lastTime = usecTimestamp();
 
-            // Convert motion to accumulated pixels (may need calibration)
-            flowData.dpixelx = (float)payload.motion_x;
-            flowData.dpixely = (float)payload.motion_y;
+            // Flip motion information to comply with sensor mounting
+            // Same transformation as flowdeck: dpixelx = -deltaY, dpixely = -deltaX
+            flowData.dpixelx = (float)(-payload.motion_y);
+            flowData.dpixely = (float)(-payload.motion_x);
 
             estimatorEnqueueFlow(&flowData);
             validFlowCount++;
