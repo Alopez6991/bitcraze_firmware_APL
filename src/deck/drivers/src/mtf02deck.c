@@ -82,17 +82,22 @@ static int32_t lastFlowY = 0;
 static uint8_t lastFlowQuality = 0;
 static uint8_t lastRangeQuality = 0;
 
+// Flow values sent to EKF (after axis transformation)
+static float lastDpixelX = 0.0f;
+static float lastDpixelY = 0.0f;
+static float lastFlowDt = 0.0f;
+
 // Debug counters
 static uint32_t msgCountRange = 0;
 static uint32_t msgCountFlow = 0;
 static uint32_t validRangeCount = 0;
 static uint32_t validFlowCount = 0;
-static uint32_t crcFailCount = 0;
 
 // Settings
 static bool useFlowDisabled = false;
 static bool useRangeDisabled = false;
 static float flowStdFixed = 2.0f;
+static float flowScale = 1.0f;  // Scaling factor for flow measurements (tune if drift occurs)
 
 /**
  * CRC8 DVB-S2 calculation for MSPv2
@@ -190,8 +195,6 @@ static bool mspParseChar(msp_msg_t* msg, uint8_t data)
             msg->state = MSP_STATE_IDLE;
             if (msg->crc_calc == msg->crc) {
                 return true;  // Valid message!
-            } else {
-                crcFailCount++;
             }
             break;
 
@@ -207,7 +210,7 @@ static bool mspParseChar(msp_msg_t* msg, uint8_t data)
  * Process rangefinder message
  * Payload format (5 bytes): quality(1) + distance(4)
  */
-static void processRangefinderMessage(msp_msg_t* msg, uint64_t* lastTime)
+static void processRangefinderMessage(msp_msg_t* msg)
 {
     if (msg->payload_len < 5) {
         return;
@@ -230,13 +233,6 @@ static void processRangefinderMessage(msp_msg_t* msg, uint64_t* lastTime)
         rangeSet(rangeDown, distance);
         rangeEnqueueDownRangeInEstimator(distance, stdDev, xTaskGetTickCount());
         validRangeCount++;
-    }
-
-    // Debug first few messages
-    static uint8_t debugCount = 0;
-    if (debugCount < 5) {
-        debugCount++;
-        DEBUG_PRINT("RANGE: qual=%u dist=%lumm\n", payload.quality, (unsigned long)payload.distance_mm);
     }
 }
 
@@ -272,20 +268,18 @@ static void processOpticalFlowMessage(msp_msg_t* msg, uint64_t* lastTime)
 
             // Flip motion information to comply with sensor mounting
             // Same transformation as flowdeck: dpixelx = -deltaY, dpixely = -deltaX
-            flowData.dpixelx = (float)(-payload.motion_y);
-            flowData.dpixely = (float)(-payload.motion_x);
+            // Apply scaling factor for tuning
+            flowData.dpixelx = flowScale * (float)(-payload.motion_y);
+            flowData.dpixely = flowScale * (float)(-payload.motion_x);
+
+            // Store for logging
+            lastDpixelX = flowData.dpixelx;
+            lastDpixelY = flowData.dpixely;
+            lastFlowDt = flowData.dt;
 
             estimatorEnqueueFlow(&flowData);
             validFlowCount++;
         }
-    }
-
-    // Debug first few messages
-    static uint8_t debugCount = 0;
-    if (debugCount < 5) {
-        debugCount++;
-        DEBUG_PRINT("FLOW: qual=%u x=%ld y=%ld\n", payload.quality, 
-                    (long)payload.motion_x, (long)payload.motion_y);
     }
 }
 
@@ -298,20 +292,14 @@ void mtf02Task(void* arg)
 
     uint64_t lastTime = usecTimestamp();
 
-    DEBUG_PRINT("MTF-02 task started (MSPv2 mode)\n");
-
-    static uint32_t byteCount = 0;
-
     while (1) {
         uint8_t data;
-        if (uart1GetDataWithTimeout(&data, M2T(100))) {
-            byteCount++;
-
+        if (uart1GetDataWithTimeout(&data, M2T(10))) {
             if (mspParseChar(&msg, data)) {
                 // Valid message received
                 switch (msg.function) {
                     case MSP_FUNC_RANGEFINDER:
-                        processRangefinderMessage(&msg, &lastTime);
+                        processRangefinderMessage(&msg);
                         break;
 
                     case MSP_FUNC_OPFLOW:
@@ -319,24 +307,8 @@ void mtf02Task(void* arg)
                         break;
 
                     default:
-                        // Debug: unknown function code
-                        {
-                            static uint8_t unknownDebug = 0;
-                            if (unknownDebug < 3) {
-                                unknownDebug++;
-                                DEBUG_PRINT("Unknown MSP func=0x%04X len=%u\n", 
-                                            msg.function, msg.payload_len);
-                            }
-                        }
                         break;
                 }
-            }
-
-            // Periodic status output
-            if (byteCount % 5000 == 0) {
-                DEBUG_PRINT("MTF02: bytes=%lu range=%lu flow=%lu crcFail=%lu (dist=%lumm)\n",
-                            byteCount, msgCountRange, msgCountFlow, crcFailCount,
-                            (unsigned long)lastDistance);
             }
         }
     }
@@ -384,11 +356,17 @@ DECK_DRIVER(mtf02Deck);
  * Logging variables
  */
 LOG_GROUP_START(mtf02)
+  // Raw sensor values
   LOG_ADD(LOG_UINT32, distance, &lastDistance)
   LOG_ADD(LOG_INT32, flowX, &lastFlowX)
   LOG_ADD(LOG_INT32, flowY, &lastFlowY)
   LOG_ADD(LOG_UINT8, flowQual, &lastFlowQuality)
   LOG_ADD(LOG_UINT8, rangeQual, &lastRangeQuality)
+  // Values sent to EKF (after axis transform)
+  LOG_ADD(LOG_FLOAT, dpixelX, &lastDpixelX)
+  LOG_ADD(LOG_FLOAT, dpixelY, &lastDpixelY)
+  LOG_ADD(LOG_FLOAT, flowDt, &lastFlowDt)
+  // Counters
   LOG_ADD(LOG_UINT32, rangeCnt, &msgCountRange)
   LOG_ADD(LOG_UINT32, flowCnt, &msgCountFlow)
   LOG_ADD(LOG_UINT32, validRange, &validRangeCount)
@@ -402,4 +380,5 @@ PARAM_GROUP_START(mtf02)
   PARAM_ADD(PARAM_UINT8, flowDisable, &useFlowDisabled)
   PARAM_ADD(PARAM_UINT8, rangeDisable, &useRangeDisabled)
   PARAM_ADD(PARAM_FLOAT, flowStd, &flowStdFixed)
+  PARAM_ADD(PARAM_FLOAT, flowScale, &flowScale)  // Scaling factor for flow (default 1.0)
 PARAM_GROUP_STOP(mtf02)
