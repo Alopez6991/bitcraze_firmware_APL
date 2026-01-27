@@ -32,6 +32,13 @@
 #include "configblock.h"
 
 // ============================================================================
+// Timestamp helper
+// ============================================================================
+static inline float getTimestamp(void) {
+  return (float)(xTaskGetTickCount() * portTICK_PERIOD_MS) / 1000.0f;
+}
+
+// ============================================================================
 // Drone ID (derived from radio address at startup)
 // ============================================================================
 static uint8_t droneId = 0;  // Will be set from radio address in appMain()
@@ -59,13 +66,12 @@ static uint32_t demoTimeMs = 60000U;         // time of the demo in ms
 #define RAMP_TIME_MS 1500U
 #define LAND_VZ_MPS 0.4f            // descent speed
 #define CUT_Z_M 0.05f               // cut controllers below this altitude
-#define DERIV_SAMPLE_INTERVAL_MS 20
-#define D0_BUFFER_SIZE 10
-#define DES_DERIV -1400.0f          // desired derivative wrt middle beacon
+#define DERIV_SAMPLE_INTERVAL_MS 10
+#define D0_BUFFER_SIZE 15
+#define DES_DERIV -1200.0f          // desired derivative wrt middle beacon
 #define RECOVER_YAWRATE 50.0f       // yawrate at 0 derivative
 #define RECOVER_DEADZONE 30.0f      // stop rotating within this target yawrate
 
-# 
 // Drone 1 specific: RC trigger threshold (active low)
 #define AUX_RC_ACTIVE_THRESH 1400
 // Drone 2+ specific: UWB trigger threshold (active high)
@@ -330,8 +336,8 @@ static bool checkAndMaybeEmergencyLand(void) {
     if (abortOverCount < 0xFF) abortOverCount++;
     if (abortOverCount >= abortConfirmCount) {
       if (!seqAbort) {
-        DEBUG_PRINT("Emergency FAR: distance0=%lu mm (> %u)\n",
-                    (unsigned long)d0, dist0AbortMm);
+        DEBUG_PRINT("[%.2f] Emergency FAR: distance0=%lu mm (> %u)\n",
+                    (double)getTimestamp(), (unsigned long)d0, dist0AbortMm);
       }
       seqAbort = true;
       trigger = true;
@@ -470,11 +476,11 @@ static StateContext ctx;
 // --- STRAIGHT state ---
 static void onEnterStraight(void) {
   innerOverCount = 0;
-  DEBUG_PRINT("Enter STRAIGHT\n");
+  DEBUG_PRINT("[%.2f] Enter STRAIGHT\n", (double)getTimestamp());
   
   // If we just came from DANCE state (drone 1 after takeoff), log it
   if (prevState == STATE_DANCE && droneId == 1) {
-    DEBUG_PRINT("STRAIGHT: rejoined swarm after DANCE\n");
+    DEBUG_PRINT("[%.2f] STRAIGHT: rejoined swarm after DANCE\n", (double)getTimestamp());
   }
 }
 
@@ -485,14 +491,14 @@ static void onExitStraight(void) {
 static FlightState checkTransitionStraight(void) {
   // STRAIGHT -> AVOID: peer too close
   if (shouldEnterAvoid()) {
-    DEBUG_PRINT("STRAIGHT -> AVOID: peer too close\n");
+    DEBUG_PRINT("[%.2f] STRAIGHT -> AVOID: peer too close\n", (double)getTimestamp());
     return STATE_AVOID;
   }
   
   // STRAIGHT -> TURN: reached outer bound (only if not in arc cooldown)
   if (ctx.d0 >= innerBoundMm && !ctx.arcCooldown) {
     if (++innerOverCount >= abortConfirmCount) {
-      DEBUG_PRINT("STRAIGHT -> TURN (d0=%lu)\n", (unsigned long)ctx.d0);
+      DEBUG_PRINT("[%.2f] STRAIGHT -> TURN (d0=%lu)\n", (double)getTimestamp(), (unsigned long)ctx.d0);
       return STATE_TURN;
     }
   } else if (ctx.d0 < innerBoundMm) {
@@ -501,7 +507,7 @@ static FlightState checkTransitionStraight(void) {
   
   // STRAIGHT -> RECOVER: outside inner bound and moving away from beacon
   if (ctx.d0 >= innerBoundMm && ctx.d0Deriv > 0 && ctx.arcCooldown) {
-    DEBUG_PRINT("STRAIGHT -> RECOVER: outside bound and deriv=%.2f (moving away)\n", (double)ctx.d0Deriv);
+    DEBUG_PRINT("[%.2f] STRAIGHT -> RECOVER: outside bound and deriv=%.2f (moving away)\n", (double)getTimestamp(), (double)ctx.d0Deriv);
     return STATE_RECOVER;
   }
   
@@ -516,10 +522,10 @@ static void executeStraight(void) {
 static void onEnterTurn(void) {
   innerUnderCount = 0;
   ctx.arcYawStart = logGetFloat(idYaw);
-  ctx.targetYaw = normalizeAngle(ctx.arcYawStart - 90.0f);
+  ctx.targetYaw = normalizeAngle(ctx.arcYawStart - 110.0f);
   ctx.arcActive = isfinite(ctx.arcYawStart);
-  DEBUG_PRINT("Enter TURN: arcActive=%d, startYaw=%.3f deg, targetYaw=%.3f deg\n",
-              ctx.arcActive ? 1 : 0, (double)ctx.arcYawStart, (double)ctx.targetYaw);
+  DEBUG_PRINT("[%.2f] Enter TURN: arcActive=%d, startYaw=%.3f deg, targetYaw=%.3f deg\n",
+              (double)getTimestamp(), ctx.arcActive ? 1 : 0, (double)ctx.arcYawStart, (double)ctx.targetYaw);
 }
 
 static void onExitTurn(void) {
@@ -529,7 +535,7 @@ static void onExitTurn(void) {
 static FlightState checkTransitionTurn(void) {
   // TURN -> AVOID: peer too close (one way, cannot return to TURN)
   if (shouldEnterAvoid()) {
-    DEBUG_PRINT("TURN -> AVOID: peer too close\n");
+    DEBUG_PRINT("[%.2f] TURN -> AVOID: peer too close\n", (double)getTimestamp());
     return STATE_AVOID;
   }
   
@@ -537,7 +543,7 @@ static FlightState checkTransitionTurn(void) {
   if (ctx.d0 <= innerBoundMm) {
     if (++innerUnderCount >= abortConfirmCount) {
       ctx.routines++;
-      DEBUG_PRINT("TURN -> STRAIGHT: routine %u complete (d0=%lu)\n", ctx.routines, (unsigned long)ctx.d0);
+      DEBUG_PRINT("[%.2f] TURN -> STRAIGHT: routine %u complete (d0=%lu)\n", (double)getTimestamp(), ctx.routines, (unsigned long)ctx.d0);
       return STATE_STRAIGHT;
     }
   } else {
@@ -554,16 +560,16 @@ static FlightState checkTransitionTurn(void) {
         ctx.arcActive = false;
         ctx.arcCooldown = true;
         if (ctx.d0Deriv <= 0) {
-          DEBUG_PRINT("TURN -> STRAIGHT: arc complete, deriv=%.2f (approaching)\n", (double)ctx.d0Deriv);
+          DEBUG_PRINT("[%.2f] TURN -> STRAIGHT: arc complete, deriv=%.2f (approaching)\n", (double)getTimestamp(), (double)ctx.d0Deriv);
           return STATE_STRAIGHT;
         } else {
-          DEBUG_PRINT("TURN -> RECOVER: arc complete, deriv=%.2f (moving away)\n", (double)ctx.d0Deriv);
+          DEBUG_PRINT("[%.2f] TURN -> RECOVER: arc complete, deriv=%.2f (moving away)\n", (double)getTimestamp(), (double)ctx.d0Deriv);
           return STATE_RECOVER;
         }
       }
     } else {
       ctx.arcActive = false;
-      DEBUG_PRINT("TURN arc: yaw unavailable, stopping arc tracking\n");
+      DEBUG_PRINT("[%.2f] TURN arc: yaw unavailable, stopping arc tracking\n", (double)getTimestamp());
     }
   }
   
@@ -571,12 +577,13 @@ static FlightState checkTransitionTurn(void) {
 }
 
 static void executeTurn(void) {
-  sendHover(fwdSpeedMps, 0.0f, targetHeightM, turnYawRateDps);
+
+  sendHover(fwdSpeedMps, 0.0f*fwdSpeedMps, targetHeightM, turnYawRateDps);
 }
 
 // --- AVOID state ---
 static void onEnterAvoid(void) {
-  DEBUG_PRINT("Enter AVOID\n");
+  DEBUG_PRINT("[%.2f] Enter AVOID\n", (double)getTimestamp());
   peerLandedCount = 0;
 }
 
@@ -589,18 +596,18 @@ static void onExitAvoid(void) {
 static FlightState checkTransitionAvoid(void) {
   // AVOID -> DANCE: peer dangerously close (emergency zone)
   if (shouldEnterDance()) {
-    DEBUG_PRINT("AVOID -> DANCE: peer in danger zone (dist=%lu <= %u)\n",
-                (unsigned long)getPeerDistance(), avoidMinLandMm);
+    DEBUG_PRINT("[%.2f] AVOID -> DANCE: peer in danger zone (dist=%lu <= %u)\n",
+                (double)getTimestamp(), (unsigned long)getPeerDistance(), avoidMinLandMm);
     return STATE_DANCE;
   }
   
   // AVOID -> STRAIGHT or RECOVER: peer far enough
   if (shouldExitAvoid()) {
     if (ctx.d0 < innerBoundMm) {
-      DEBUG_PRINT("AVOID -> STRAIGHT: peer far, inside bound (d0=%lu)\n", (unsigned long)ctx.d0);
+      DEBUG_PRINT("[%.2f] AVOID -> STRAIGHT: peer far, inside bound (d0=%lu)\n", (double)getTimestamp(), (unsigned long)ctx.d0);
       return STATE_STRAIGHT;
     } else {
-      DEBUG_PRINT("AVOID -> RECOVER: peer far, outside bound (d0=%lu)\n", (unsigned long)ctx.d0);
+      DEBUG_PRINT("[%.2f] AVOID -> RECOVER: peer far, outside bound (d0=%lu)\n", (double)getTimestamp(), (unsigned long)ctx.d0);
       return STATE_RECOVER;
     }
   }
@@ -613,30 +620,37 @@ static void executeAvoid(void) {
 }
 
 // --- RECOVER state ---
+static uint8_t recoverDebugCounter = 0;  // For throttled debug output
+
 static void onEnterRecover(void) {
+  recoverDebugCounter = 0;  // Reset debug counter on entry
   if (droneId != 1) {
     if (ctx.d0 > dist0AbortMm - 800) { // subject to tuning
-      DEBUG_PRINT("Keeping direction after avoid\n");
+      DEBUG_PRINT("[%.2f] Keeping direction after avoid\n", (double)getTimestamp());
       ctx.rotationDirection = -1;
     }
   }
-  DEBUG_PRINT("Enter RECOVER\n");
+  DEBUG_PRINT("[%.2f] Enter RECOVER: d0=%lu, d0Deriv=%.1f, rotDir=%d\n",
+              (double)getTimestamp(), (unsigned long)ctx.d0, (double)ctx.d0Deriv, ctx.rotationDirection);
 }
 
 static void onExitRecover(void) {
+  DEBUG_PRINT("[%.2f] Exit RECOVER: d0=%lu, d0Deriv=%.1f\n",
+              (double)getTimestamp(), (unsigned long)ctx.d0, (double)ctx.d0Deriv);
   ctx.rotationDirection = 1;
 }
 
 static FlightState checkTransitionRecover(void) {
   // RECOVER -> AVOID: peer too close
   if (shouldEnterAvoid()) {
-    DEBUG_PRINT("RECOVER -> AVOID: peer too close\n");
+    DEBUG_PRINT("[%.2f] RECOVER -> AVOID: peer too close\n", (double)getTimestamp());
     return STATE_AVOID;
   }
   
   // RECOVER -> STRAIGHT: back inside inner bound
   if (ctx.d0 > 0 && ctx.d0 <= innerBoundMm) {
-    DEBUG_PRINT("RECOVER -> STRAIGHT: made it back to the circle (d0=%lu)\n", (unsigned long)ctx.d0);
+    DEBUG_PRINT("[%.2f] RECOVER -> STRAIGHT: success! d0=%lu <= %u, final deriv=%.1f\n",
+                (double)getTimestamp(), (unsigned long)ctx.d0, innerBoundMm, (double)ctx.d0Deriv);
     return STATE_STRAIGHT;
   }
   
@@ -645,14 +659,27 @@ static FlightState checkTransitionRecover(void) {
 
 static void executeRecover(void) {
   float yawCommand = recoverFactor * fabsf(ctx.d0Deriv - DES_DERIV);
+  float yawCommandRaw = yawCommand;  // Store pre-deadzone value for debugging
   yawCommand = yawCommand > RECOVER_DEADZONE ? yawCommand : 0.0f;
-  yawCommand *= ctx.rotationDirection;
-  sendHover(fwdSpeedMps, 0.0f, targetHeightM, yawCommand);
+  yawCommand = fminf(yawCommand, 70.0f);
+  float yawCommandFinal = yawCommand * ctx.rotationDirection;
+  
+  // Throttled debug output
+  if (++recoverDebugCounter >= 10) {
+    recoverDebugCounter = 0;
+    DEBUG_PRINT("[%.2f] RECOVER: d0=%lu innerB=%u | deriv=%.1f desDeriv=%.1f | yawRaw=%.1f yawFinal=%.1f rotDir=%d\n",
+                (double)getTimestamp(), (unsigned long)ctx.d0, innerBoundMm,
+                (double)ctx.d0Deriv, (double)DES_DERIV,
+                (double)yawCommandRaw, (double)yawCommandFinal,
+                ctx.rotationDirection);
+  }
+  
+  sendHover(fwdSpeedMps, 0.0f, targetHeightM, yawCommandFinal);
 }
 
 // --- DANCE state ---
 static void onEnterDance(void) {
-  DEBUG_PRINT("Enter DANCE (drone %u)\n", droneId);
+  DEBUG_PRINT("[%.2f] Enter DANCE (drone %u)\n", (double)getTimestamp(), droneId);
   peerLandedCount = 0;
   rejoinCount = 0;
   danceHasLanded = false;
@@ -660,7 +687,7 @@ static void onEnterDance(void) {
 }
 
 static void onExitDance(void) {
-  DEBUG_PRINT("Exit DANCE (drone %u)\n", droneId);
+  DEBUG_PRINT("[%.2f] Exit DANCE (drone %u)\n", (double)getTimestamp(), droneId);
   peerLandedCount = 0;
   rejoinCount = 0;
   danceHasLanded = false;
@@ -673,10 +700,10 @@ static FlightState checkTransitionDance(void) {
     if (danceHasTakenOff) {
       // Choose state based on current position
       if (ctx.d0 < innerBoundMm) {
-        DEBUG_PRINT("DANCE -> STRAIGHT: drone 1 rejoining (d0=%lu)\n", (unsigned long)ctx.d0);
+        DEBUG_PRINT("[%.2f] DANCE -> STRAIGHT: drone 1 rejoining (d0=%lu)\n", (double)getTimestamp(), (unsigned long)ctx.d0);
         return STATE_STRAIGHT;
       } else {
-        DEBUG_PRINT("DANCE -> RECOVER: drone 1 rejoining outside bound (d0=%lu)\n", (unsigned long)ctx.d0);
+        DEBUG_PRINT("[%.2f] DANCE -> RECOVER: drone 1 rejoining outside bound (d0=%lu)\n", (double)getTimestamp(), (unsigned long)ctx.d0);
         return STATE_RECOVER;
       }
     }
@@ -691,10 +718,10 @@ static FlightState checkTransitionDance(void) {
     if (peerLandedCount >= PEER_LANDED_CONFIRM_COUNT) {
       // Choose state based on current position
       if (ctx.d0 < innerBoundMm) {
-        DEBUG_PRINT("DANCE -> STRAIGHT: drone %u exiting, peer landed (d0=%lu)\n", droneId, (unsigned long)ctx.d0);
+        DEBUG_PRINT("[%.2f] DANCE -> STRAIGHT: drone %u exiting, peer landed (d0=%lu)\n", (double)getTimestamp(), droneId, (unsigned long)ctx.d0);
         return STATE_STRAIGHT;
       } else {
-        DEBUG_PRINT("DANCE -> RECOVER: drone %u exiting, peer landed (d0=%lu)\n", droneId, (unsigned long)ctx.d0);
+        DEBUG_PRINT("[%.2f] DANCE -> RECOVER: drone %u exiting, peer landed (d0=%lu)\n", (double)getTimestamp(), droneId, (unsigned long)ctx.d0);
         return STATE_RECOVER;
       }
     }
@@ -712,13 +739,24 @@ static void executeDance(void) {
       // First send freeze command, then perform landing
       sendHover(0.0f, 0.0f, targetHeightM, 0.0f);  // Freeze momentarily
       
-      DEBUG_PRINT("DANCE: drone 1 landing\n");
+      DEBUG_PRINT("[%.2f] DANCE: drone 1 landing\n", (double)getTimestamp());
       landToZero();
       danceHasLanded = true;
-      DEBUG_PRINT("DANCE: drone 1 landed, waiting for peer to move away\n");
+      DEBUG_PRINT("[%.2f] DANCE: drone 1 landed, waiting for peer to move away\n", (double)getTimestamp());
       
     } else if (!danceHasTakenOff) {
-      // Phase 2: Wait for peer to be far enough away, then take off
+      // Phase 2: Wait for peer - KEEP SENDING SETPOINTS TO PREVENT WDT TIMEOUT
+      // Send a "do nothing" setpoint to keep the commander watchdog happy
+      setpoint_t idle;
+      memset(&idle, 0, sizeof(idle));
+      idle.mode.x = modeDisable;
+      idle.mode.y = modeDisable;
+      idle.mode.z = modeDisable;
+      idle.mode.yaw = modeDisable;
+      idle.thrust = 0;
+      commanderSetSetpoint(&idle, 3);
+      
+      // Check if peer is far enough to take off
       const uint32_t peerDist = getPeerDistance();
       const uint32_t rejoinThresh = peerCloseMm + REJOIN_EXTRA_MM;
       
@@ -729,11 +767,11 @@ static void executeDance(void) {
       }
       
       if (rejoinCount >= REJOIN_CONFIRM_COUNT) {
-        DEBUG_PRINT("DANCE: drone 1 taking off (peer dist=%lu >= %lu)\n",
-                    (unsigned long)peerDist, (unsigned long)rejoinThresh);
+        DEBUG_PRINT("[%.2f] DANCE: drone 1 taking off (peer dist=%lu >= %lu)\n",
+                    (double)getTimestamp(), (unsigned long)peerDist, (unsigned long)rejoinThresh);
         rampToHeight(targetHeightM, RAMP_TIME_MS);
         danceHasTakenOff = true;
-        DEBUG_PRINT("DANCE: drone 1 airborne, rejoining swarm\n");
+        DEBUG_PRINT("[%.2f] DANCE: drone 1 airborne, rejoining swarm\n", (double)getTimestamp());
       }
       // While waiting, do nothing (motors are off from landToZero)
     }
@@ -816,8 +854,8 @@ static void runSequence(void) {
   uint32_t startTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
   const char* yawDir = (droneId == 1) ? "CW" : "CCW";
-  DEBUG_PRINT("Drone %u: fwd, TURN if d0>=%u; AVOID peer<=%u (%s yaw); DANCE if peer<=%u; land if d0>=%u\n",
-              droneId, innerBoundMm, peerCloseMm, yawDir, avoidMinLandMm, dist0AbortMm);
+  DEBUG_PRINT("[%.2f] Drone %u: fwd, TURN if d0>=%u; AVOID peer<=%u (%s yaw); DANCE if peer<=%u; land if d0>=%u\n",
+              (double)getTimestamp(), droneId, innerBoundMm, peerCloseMm, yawDir, avoidMinLandMm, dist0AbortMm);
 
   // Kill check before takeoff (drone 2+ only)
   if (checkKillAndDisarm()) return;
@@ -825,7 +863,7 @@ static void runSequence(void) {
   // Takeoff
   rampToHeight(targetHeightM, RAMP_TIME_MS);
 
-  const uint32_t dtMs = 20;
+  const uint32_t dtMs = 10;
 
   while (!seqAbort) {
     uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -848,30 +886,30 @@ static void runSequence(void) {
     ctx.d0Deriv = d0BufferGetDerivative();
 
     // DEBUG: Check Z estimate, z-ranger, and optic flow
-    static uint8_t zDebugCounter = 0;
-    if (++zDebugCounter >= 50) {  // Every ~1 second
-      zDebugCounter = 0;
-      float z = logGetFloat(idZ);
-      uint16_t zrange = 0;
-      int16_t flowX = 0;
-      int16_t flowY = 0;
-      if (logVarIdIsValid(idZrange)) {
-        zrange = logGetUint(idZrange);
-      }
-      if (logVarIdIsValid(idMotionDeltaX)) {
-        flowX = logGetInt(idMotionDeltaX);
-      }
-      if (logVarIdIsValid(idMotionDeltaY)) {
-        flowY = logGetInt(idMotionDeltaY);
-      }
-      DEBUG_PRINT("State=%u Z=%.2f zrange=%u mm flowX=%d flowY=%d\n",
-                  currentState, (double)z, zrange, flowX, flowY);
-    }
+    // static uint8_t zDebugCounter = 0;
+    // if (++zDebugCounter >= 50) {  // Every ~1 second
+    //   zDebugCounter = 0;
+    //   float z = logGetFloat(idZ);
+    //   uint16_t zrange = 0;
+    //   int16_t flowX = 0;
+    //   int16_t flowY = 0;
+    //   if (logVarIdIsValid(idZrange)) {
+    //     zrange = logGetUint(idZrange);
+    //   }
+    //   if (logVarIdIsValid(idMotionDeltaX)) {
+    //     flowX = logGetInt(idMotionDeltaX);
+    //   }
+    //   if (logVarIdIsValid(idMotionDeltaY)) {
+    //     flowY = logGetInt(idMotionDeltaY);
+    //   }
+    //   DEBUG_PRINT("State=%u Z=%.2f zrange=%u mm flowX=%d flowY=%d\n",
+    //               currentState, (double)z, zrange, flowX, flowY);
+    // }
 
     // Clear arc cooldown once we re-enter the inner circle
     if (ctx.arcCooldown && ctx.d0 > 0 && ctx.d0 <= innerBoundMm) {
       ctx.arcCooldown = false;
-      DEBUG_PRINT("ARC cooldown cleared by inner re-entry (d0=%lu)\n", (unsigned long)ctx.d0);
+      DEBUG_PRINT("[%.2f] ARC cooldown cleared by inner re-entry (d0=%lu)\n", (double)getTimestamp(), (unsigned long)ctx.d0);
     }
 
     // ========================================================================
@@ -895,9 +933,9 @@ static void runSequence(void) {
 
   landToZero();
   if (seqAbort) {
-    DEBUG_PRINT("Emergency landing\n");
+    DEBUG_PRINT("[%.2f] Emergency landing\n", (double)getTimestamp());
   } else {
-    DEBUG_PRINT("Finished demo in approx %u routines\n", ctx.routines);
+    DEBUG_PRINT("[%.2f] Finished demo in approx %u routines\n", (double)getTimestamp(), ctx.routines);
   }
 }
 
@@ -942,7 +980,7 @@ static void setVelocityControllerGains(void) {
   if (PARAM_VARID_IS_VALID(vzKiId)) paramSetFloat(vzKiId, 0.5f);
   if (PARAM_VARID_IS_VALID(vzKpId)) paramSetFloat(vzKpId, 20.0f);
 
-  DEBUG_PRINT("Velocity controller gains set\n");
+  DEBUG_PRINT("[%.2f] Velocity controller gains set\n", (double)getTimestamp());
 }
 
 // ============================================================================
@@ -951,7 +989,7 @@ static void setVelocityControllerGains(void) {
 void appMain(void) {
   // Get drone ID from radio address (last nibble, like lpsTwrTag does)
   droneId = (uint8_t)(configblockGetRadioAddress() & 0xF);
-  DEBUG_PRINT("Flapper Swarm App started, droneId=%u (from radio address)\n", droneId);
+  DEBUG_PRINT("[%.2f] Flapper Swarm App started, droneId=%u (from radio address)\n", (double)getTimestamp(), droneId);
 
   
   // Resolve log IDs based on droneId
@@ -977,8 +1015,8 @@ void appMain(void) {
       ensureLogId(&idHeight2,    "ranging", "height2");
       vTaskDelay(pdMS_TO_TICKS(100));
     }
-    DEBUG_PRINT("Drone 1: RC trigger (cppm.aux0<%d), avoid on distance2<=%u (CW)\n",
-      AUX_RC_ACTIVE_THRESH, peerCloseMm);
+    DEBUG_PRINT("[%.2f] Drone 1: RC trigger (cppm.aux0<%d), avoid on distance2<=%u (CW)\n",
+      (double)getTimestamp(), AUX_RC_ACTIVE_THRESH, peerCloseMm);
   } else {
     // Drone 2+: UWB trigger/kill and distance/height to drone 1
     while (!logVarIdIsValid(idRangingAux1) || !logVarIdIsValid(idRangingAux2) ||
@@ -989,8 +1027,8 @@ void appMain(void) {
       ensureLogId(&idHeight1,     "ranging", "height1");
       vTaskDelay(pdMS_TO_TICKS(100));
     }
-    DEBUG_PRINT("Drone %u: UWB trigger (ranging.aux1>%u), kill (ranging.aux2), avoid on distance1<=%u (CCW)\n",
-      droneId, AUX_UWB_ACTIVE_THRESHOLD, peerCloseMm);
+    DEBUG_PRINT("[%.2f] Drone %u: UWB trigger (ranging.aux1>%u), kill (ranging.aux2), avoid on distance1<=%u (CCW)\n",
+      (double)getTimestamp(), droneId, AUX_UWB_ACTIVE_THRESHOLD, peerCloseMm);
   }
       
   bool wasActive = false;
