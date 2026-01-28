@@ -80,6 +80,17 @@ static uint32_t demoTimeMs = 60000U;         // time of the demo in ms
 // Height threshold below which we consider a drone "landed" (meters)
 #define PEER_LANDED_HEIGHT_M 0.1f
 
+// Dance state constants
+#define PEER_LANDED_CONFIRM_COUNT 3
+#define REJOIN_EXTRA_MM 50U
+#define REJOIN_CONFIRM_COUNT 3
+
+// UTURN state constants
+#define MIDDLE_BOUND_OFFSET_MM 500U         // Middle bound = dist0AbortMm - 250mm
+#define UTURN_CONFIRM_COUNT 2               // Samples to confirm middle bound exceeded
+#define UTURN_YAW_RATE_DPS 60.0f            // Yaw rate for 180° turn (deg/s)
+#define UTURN_YAW_TOLERANCE 5.0f            // Degrees tolerance for completing turn
+
 // ============================================================================
 // Log variable IDs
 // ============================================================================
@@ -108,11 +119,13 @@ static logVarId_t idHeight1     = (logVarId_t)0xFFFF;  // height of drone 1
 // State machine
 // ============================================================================
 typedef enum {
-  STATE_STRAIGHT = 0,
-  STATE_TURN     = 1,
-  STATE_AVOID    = 2,
-  STATE_RECOVER  = 3,
-  STATE_DANCE    = 4
+  STATE_STRAIGHT  = 0,
+  STATE_TURN      = 1,
+  STATE_AVOID     = 2,
+  STATE_RECOVER   = 3,
+  STATE_DANCE     = 4,
+  STATE_UTURN     = 5,   // Emergency 180° turn near outer bound (one-shot)
+  STATE_UTURN_FLY = 6    // Flying straight after UTURN, trying to reach inner bound
 } FlightState;
 
 static uint8_t currentState = STATE_STRAIGHT;  // Exposed for logging
@@ -133,20 +146,23 @@ static uint8_t departCount = 0;
 static uint8_t peerLandedCount = 0;
 static uint8_t rejoinCount = 0;
 
-// Dance state constants
-#define PEER_LANDED_CONFIRM_COUNT 3
-#define REJOIN_EXTRA_MM 50U
-#define REJOIN_CONFIRM_COUNT 3
-
 // Dance state tracking
 static bool danceHasLanded = false;  // Drone 1: tracks if we've completed landing
 static bool danceHasTakenOff = false; // Drone 1: tracks if we've completed takeoff
+
+// UTURN state variables
+static uint8_t middleBoundOverCount = 0;    // Confirmation counter for middle bound
+static bool uturnUsed = false;              // One-shot flag: true after UTURN has been attempted
+static float uturnYawStart = 0.0f;          // Yaw at start of UTURN
+static float uturnTargetYaw = 0.0f;         // Target yaw (180° from start)
+static bool uturnActive = false;            // Whether we're actively tracking the 180° turn
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
 
 // Recover variables
 static const float recoverFactor = - ( RECOVER_YAWRATE / DES_DERIV);
+
 // ============================================================================
 // Derivative buffer for d0
 // ============================================================================
@@ -215,6 +231,27 @@ static float d0BufferGetDerivative(void) {
   
   return slopePerInterval / intervalS;
 }
+
+// ============================================================================
+// State machine context (shared between state handlers)
+// ============================================================================
+typedef struct {
+  // Arc tracking (TURN state)
+  bool arcActive;
+  bool arcCooldown;
+  float arcYawStart;
+  float targetYaw;
+  int rotationDirection;
+  
+  // Counters
+  uint8_t routines;
+  
+  // Current sensor readings (updated each loop)
+  uint32_t d0;
+  float d0Deriv;
+} StateContext;
+
+static StateContext ctx;
 
 // ============================================================================
 // Utility functions
@@ -404,6 +441,31 @@ static bool shouldEnterDance(void) {
 }
 
 // ============================================================================
+// UTURN helper functions
+// ============================================================================
+static inline uint16_t getMiddleBoundMm(void) {
+  return dist0AbortMm - MIDDLE_BOUND_OFFSET_MM;
+}
+
+static bool shouldEnterUturn(void) {
+  // Only allow UTURN once per flight sequence
+  if (uturnUsed) {
+    return false;
+  }
+  
+  // Check if we've exceeded the middle bound
+  const uint16_t middleBound = getMiddleBoundMm();
+  if (ctx.d0 >= middleBound && ctx.d0 < dist0AbortMm) {
+    if (++middleBoundOverCount >= UTURN_CONFIRM_COUNT) {
+      return true;
+    }
+  } else {
+    middleBoundOverCount = 0;
+  }
+  return false;
+}
+
+// ============================================================================
 // Landing and takeoff
 // ============================================================================
 static void landToZero(void) {
@@ -449,38 +511,23 @@ static void rampToHeight(float zTarget, uint32_t rampMs) {
 }
 
 // ============================================================================
-// State machine context (shared between state handlers)
-// ============================================================================
-typedef struct {
-  // Arc tracking (TURN state)
-  bool arcActive;
-  bool arcCooldown;
-  float arcYawStart;
-  float targetYaw;
-  int rotationDirection;
-  
-  // Counters
-  uint8_t routines;
-  
-  // Current sensor readings (updated each loop)
-  uint32_t d0;
-  float d0Deriv;
-} StateContext;
-
-static StateContext ctx;
-
-// ============================================================================
 // State handlers: onEnter, onExit, execute, checkTransition
 // ============================================================================
 
 // --- STRAIGHT state ---
 static void onEnterStraight(void) {
   innerOverCount = 0;
+  middleBoundOverCount = 0;  // Reset UTURN confirmation counter
   DEBUG_PRINT("[%.2f] Enter STRAIGHT\n", (double)getTimestamp());
   
   // If we just came from DANCE state (drone 1 after takeoff), log it
   if (prevState == STATE_DANCE && droneId == 1) {
     DEBUG_PRINT("[%.2f] STRAIGHT: rejoined swarm after DANCE\n", (double)getTimestamp());
+  }
+  
+  // If we came from UTURN_FLY, we successfully made it back
+  if (prevState == STATE_UTURN_FLY) {
+    DEBUG_PRINT("[%.2f] STRAIGHT: UTURN recovery successful!\n", (double)getTimestamp());
   }
 }
 
@@ -493,6 +540,13 @@ static FlightState checkTransitionStraight(void) {
   if (shouldEnterAvoid()) {
     DEBUG_PRINT("[%.2f] STRAIGHT -> AVOID: peer too close\n", (double)getTimestamp());
     return STATE_AVOID;
+  }
+  
+  // STRAIGHT -> UTURN: approaching outer bound (one-shot emergency turn)
+  if (shouldEnterUturn()) {
+    DEBUG_PRINT("[%.2f] STRAIGHT -> UTURN: middle bound exceeded (d0=%lu >= %u)\n",
+                (double)getTimestamp(), (unsigned long)ctx.d0, getMiddleBoundMm());
+    return STATE_UTURN;
   }
   
   // STRAIGHT -> TURN: reached outer bound (only if not in arc cooldown)
@@ -624,6 +678,7 @@ static uint8_t recoverDebugCounter = 0;  // For throttled debug output
 
 static void onEnterRecover(void) {
   recoverDebugCounter = 0;  // Reset debug counter on entry
+  middleBoundOverCount = 0;  // Reset UTURN confirmation counter
   if (droneId != 1) {
     if (ctx.d0 > dist0AbortMm - 800) { // subject to tuning
       DEBUG_PRINT("[%.2f] Keeping direction after avoid\n", (double)getTimestamp());
@@ -645,6 +700,13 @@ static FlightState checkTransitionRecover(void) {
   if (shouldEnterAvoid()) {
     DEBUG_PRINT("[%.2f] RECOVER -> AVOID: peer too close\n", (double)getTimestamp());
     return STATE_AVOID;
+  }
+  
+  // RECOVER -> UTURN: approaching outer bound (one-shot emergency turn)
+  if (shouldEnterUturn()) {
+    DEBUG_PRINT("[%.2f] RECOVER -> UTURN: middle bound exceeded (d0=%lu >= %u)\n",
+                (double)getTimestamp(), (unsigned long)ctx.d0, getMiddleBoundMm());
+    return STATE_UTURN;
   }
   
   // RECOVER -> STRAIGHT: back inside inner bound
@@ -784,47 +846,158 @@ static void executeDance(void) {
   }
 }
 
+// --- UTURN state (turning phase) ---
+static void onEnterUturn(void) {
+  DEBUG_PRINT("[%.2f] Enter UTURN (drone %u)\n", (double)getTimestamp(), droneId);
+  
+  // Mark UTURN as used (one-shot)
+  uturnUsed = true;
+  
+  // Capture starting yaw and compute target (180° turn)
+  uturnYawStart = logGetFloat(idYaw);
+  uturnTargetYaw = normalizeAngle(uturnYawStart + 180.0f);
+  uturnActive = isfinite(uturnYawStart);
+  
+  middleBoundOverCount = 0;
+  
+  DEBUG_PRINT("[%.2f] UTURN: startYaw=%.1f, targetYaw=%.1f, active=%d\n",
+              (double)getTimestamp(), (double)uturnYawStart, (double)uturnTargetYaw, uturnActive ? 1 : 0);
+}
+
+static void onExitUturn(void) {
+  DEBUG_PRINT("[%.2f] Exit UTURN (drone %u)\n", (double)getTimestamp(), droneId);
+  uturnActive = false;
+  middleBoundOverCount = 0;
+}
+
+static FlightState checkTransitionUturn(void) {
+  // UTURN -> AVOID: peer too close (safety override)
+  if (shouldEnterAvoid()) {
+    DEBUG_PRINT("[%.2f] UTURN -> AVOID: peer too close\n", (double)getTimestamp());
+    return STATE_AVOID;
+  }
+  
+  // Check if 180° turn complete
+  if (uturnActive) {
+    float curYaw = logGetFloat(idYaw);
+    if (isfinite(curYaw)) {
+      float yawDiff = fabsf(normalizeAngle(curYaw - uturnTargetYaw));
+      
+      if (yawDiff <= UTURN_YAW_TOLERANCE) {
+        // 180° turn complete - transition to fly-back phase
+        uturnActive = false;
+        DEBUG_PRINT("[%.2f] UTURN -> UTURN_FLY: 180 complete, now flying back (d0=%lu)\n",
+                    (double)getTimestamp(), (unsigned long)ctx.d0);
+        return STATE_UTURN_FLY;
+      }
+    } else {
+      // Yaw unavailable, abort tracking and go to fly-back anyway
+      uturnActive = false;
+      DEBUG_PRINT("[%.2f] UTURN -> UTURN_FLY: yaw unavailable, blind fly-back (d0=%lu)\n",
+                  (double)getTimestamp(), (unsigned long)ctx.d0);
+      return STATE_UTURN_FLY;
+    }
+  }
+  
+  // If uturnActive became false somehow, go to fly-back
+  if (!uturnActive) {
+    DEBUG_PRINT("[%.2f] UTURN -> UTURN_FLY: turn tracking ended (d0=%lu)\n",
+                (double)getTimestamp(), (unsigned long)ctx.d0);
+    return STATE_UTURN_FLY;
+  }
+  
+  return STATE_UTURN;  // Still turning
+}
+
+static void executeUturn(void) {
+  // Stop and turn in place at UTURN_YAW_RATE_DPS (zero forward speed)
+  sendHover(0.0f, 0.0f, targetHeightM, UTURN_YAW_RATE_DPS);
+}
+
+// --- UTURN_FLY state (flying straight back after 180° turn) ---
+static void onEnterUturnFly(void) {
+  DEBUG_PRINT("[%.2f] Enter UTURN_FLY (drone %u): flying straight, hoping to reach inner bound\n",
+              (double)getTimestamp(), droneId);
+}
+
+static void onExitUturnFly(void) {
+  DEBUG_PRINT("[%.2f] Exit UTURN_FLY (drone %u)\n", (double)getTimestamp(), droneId);
+}
+
+static FlightState checkTransitionUturnFly(void) {
+  // UTURN_FLY -> AVOID: peer too close (safety override)
+  if (shouldEnterAvoid()) {
+    DEBUG_PRINT("[%.2f] UTURN_FLY -> AVOID: peer too close\n", (double)getTimestamp());
+    return STATE_AVOID;
+  }
+  
+  // UTURN_FLY -> STRAIGHT: reached inner bound (success!)
+  if (ctx.d0 > 0 && ctx.d0 <= innerBoundMm) {
+    DEBUG_PRINT("[%.2f] UTURN_FLY -> STRAIGHT: made it back! (d0=%lu <= %u)\n",
+                (double)getTimestamp(), (unsigned long)ctx.d0, innerBoundMm);
+    return STATE_STRAIGHT;
+  }
+  
+  // If we hit outer bound, emergency land will be triggered by checkAndMaybeEmergencyLand()
+  // No transition to TURN or RECOVER - just keep flying straight
+  
+  return STATE_UTURN_FLY;  // Keep flying straight
+}
+
+static void executeUturnFly(void) {
+  // Fly straight forward at normal speed
+  sendHover(fwdSpeedMps, 0.0f, targetHeightM, 0.0f);
+}
+
 // ============================================================================
 // State machine dispatcher functions
 // ============================================================================
 static void onEnterState(FlightState state) {
   switch (state) {
-    case STATE_STRAIGHT: onEnterStraight(); break;
-    case STATE_TURN:     onEnterTurn();     break;
-    case STATE_AVOID:    onEnterAvoid();    break;
-    case STATE_RECOVER:  onEnterRecover();  break;
-    case STATE_DANCE:    onEnterDance();    break;
+    case STATE_STRAIGHT:  onEnterStraight();  break;
+    case STATE_TURN:      onEnterTurn();      break;
+    case STATE_AVOID:     onEnterAvoid();     break;
+    case STATE_RECOVER:   onEnterRecover();   break;
+    case STATE_DANCE:     onEnterDance();     break;
+    case STATE_UTURN:     onEnterUturn();     break;
+    case STATE_UTURN_FLY: onEnterUturnFly();  break;
   }
 }
 
 static void onExitState(FlightState state) {
   switch (state) {
-    case STATE_STRAIGHT: onExitStraight(); break;
-    case STATE_TURN:     onExitTurn();     break;
-    case STATE_AVOID:    onExitAvoid();    break;
-    case STATE_RECOVER:  onExitRecover();  break;
-    case STATE_DANCE:    onExitDance();    break;
+    case STATE_STRAIGHT:  onExitStraight();  break;
+    case STATE_TURN:      onExitTurn();      break;
+    case STATE_AVOID:     onExitAvoid();     break;
+    case STATE_RECOVER:   onExitRecover();   break;
+    case STATE_DANCE:     onExitDance();     break;
+    case STATE_UTURN:     onExitUturn();     break;
+    case STATE_UTURN_FLY: onExitUturnFly();  break;
   }
 }
 
 static FlightState checkTransition(FlightState state) {
   switch (state) {
-    case STATE_STRAIGHT: return checkTransitionStraight();
-    case STATE_TURN:     return checkTransitionTurn();
-    case STATE_AVOID:    return checkTransitionAvoid();
-    case STATE_RECOVER:  return checkTransitionRecover();
-    case STATE_DANCE:    return checkTransitionDance();
+    case STATE_STRAIGHT:  return checkTransitionStraight();
+    case STATE_TURN:      return checkTransitionTurn();
+    case STATE_AVOID:     return checkTransitionAvoid();
+    case STATE_RECOVER:   return checkTransitionRecover();
+    case STATE_DANCE:     return checkTransitionDance();
+    case STATE_UTURN:     return checkTransitionUturn();
+    case STATE_UTURN_FLY: return checkTransitionUturnFly();
   }
   return state;
 }
 
 static void executeState(FlightState state) {
   switch (state) {
-    case STATE_STRAIGHT: executeStraight(); break;
-    case STATE_TURN:     executeTurn();     break;
-    case STATE_AVOID:    executeAvoid();    break;
-    case STATE_RECOVER:  executeRecover();  break;
-    case STATE_DANCE:    executeDance();    break;
+    case STATE_STRAIGHT:  executeStraight();  break;
+    case STATE_TURN:      executeTurn();      break;
+    case STATE_AVOID:     executeAvoid();     break;
+    case STATE_RECOVER:   executeRecover();   break;
+    case STATE_DANCE:     executeDance();     break;
+    case STATE_UTURN:     executeUturn();     break;
+    case STATE_UTURN_FLY: executeUturnFly();  break;
   }
 }
 
@@ -838,6 +1011,9 @@ static void runSequence(void) {
   approachCount = departCount = 0;
   peerLandedCount = 0;
   rejoinCount = 0;
+  middleBoundOverCount = 0;
+  uturnUsed = false;          // Reset one-shot flag for new sequence
+  uturnActive = false;
   
   // Reset state context
   memset(&ctx, 0, sizeof(ctx));
@@ -854,8 +1030,9 @@ static void runSequence(void) {
   uint32_t startTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
   const char* yawDir = (droneId == 1) ? "CW" : "CCW";
-  DEBUG_PRINT("[%.2f] Drone %u: fwd, TURN if d0>=%u; AVOID peer<=%u (%s yaw); DANCE if peer<=%u; land if d0>=%u\n",
-              (double)getTimestamp(), droneId, innerBoundMm, peerCloseMm, yawDir, avoidMinLandMm, dist0AbortMm);
+  DEBUG_PRINT("[%.2f] Drone %u: TURN@%u, UTURN@%u(one-shot), AVOID peer<=%u (%s), DANCE peer<=%u, abort@%u\n",
+              (double)getTimestamp(), droneId, innerBoundMm, getMiddleBoundMm(), 
+              peerCloseMm, yawDir, avoidMinLandMm, dist0AbortMm);
 
   // Kill check before takeoff (drone 2+ only)
   if (checkKillAndDisarm()) return;
@@ -884,27 +1061,6 @@ static void runSequence(void) {
     ctx.d0 = logGetUint(idDistance0);
     d0BufferAdd(ctx.d0, now);
     ctx.d0Deriv = d0BufferGetDerivative();
-
-    // DEBUG: Check Z estimate, z-ranger, and optic flow
-    // static uint8_t zDebugCounter = 0;
-    // if (++zDebugCounter >= 50) {  // Every ~1 second
-    //   zDebugCounter = 0;
-    //   float z = logGetFloat(idZ);
-    //   uint16_t zrange = 0;
-    //   int16_t flowX = 0;
-    //   int16_t flowY = 0;
-    //   if (logVarIdIsValid(idZrange)) {
-    //     zrange = logGetUint(idZrange);
-    //   }
-    //   if (logVarIdIsValid(idMotionDeltaX)) {
-    //     flowX = logGetInt(idMotionDeltaX);
-    //   }
-    //   if (logVarIdIsValid(idMotionDeltaY)) {
-    //     flowY = logGetInt(idMotionDeltaY);
-    //   }
-    //   DEBUG_PRINT("State=%u Z=%.2f zrange=%u mm flowX=%d flowY=%d\n",
-    //               currentState, (double)z, zrange, flowX, flowY);
-    // }
 
     // Clear arc cooldown once we re-enter the inner circle
     if (ctx.arcCooldown && ctx.d0 > 0 && ctx.d0 <= innerBoundMm) {
@@ -1076,7 +1232,7 @@ PARAM_GROUP_STOP(swarm)
 
 // ============================================================================
 // Log definitions (for monitoring state)
-// State values: 0=STRAIGHT, 1=TURN, 2=AVOID, 3=RECOVER, 4=DANCE
+// State values: 0=STRAIGHT, 1=TURN, 2=AVOID, 3=RECOVER, 4=DANCE, 5=UTURN, 6=UTURN_FLY
 // ============================================================================
 LOG_GROUP_START(swarm)
   LOG_ADD(LOG_UINT8, state, &currentState)
