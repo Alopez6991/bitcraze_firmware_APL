@@ -5,12 +5,13 @@ This module ties together the drone physics and controller,
 and provides a visual simulation using Pygame.
 """
 import math
+import random
 import sys
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import List, Tuple, Optional
 
-from .config import Config, default_config, DroneConfig
+from .config import Config, default_config, DroneConfig, DroneInitialState
 from .drone import Drone, DroneState, NoisyKinematicPhysics, KinematicPhysics, UWBSensor
 from .controller import SwarmController, FlightMode, LandingReason
 
@@ -134,7 +135,71 @@ class Simulator:
         # Statistics
         self.min_peer_distance = float('inf')
         self.avoidance_events = 0
+        
+        # Random initial state overrides (None = use config values)
+        self._random_initial_states: List[Optional[DroneInitialState]] = [None, None]
     
+    def _generate_random_initial_state(self, drone_id: int) -> DroneInitialState:
+        """
+        Generate a random initial state for a drone.
+        
+        Places drones randomly within the inner boundary with random yaw,
+        ensuring they are not too close to each other or the beacon.
+        
+        Args:
+            drone_id: The drone ID (1 or 2)
+            
+        Returns:
+            DroneInitialState with random x, y, yaw (z is kept from config)
+        """
+        cfg = self.config
+        flight = cfg.flight
+        beacon_x, beacon_y, beacon_z = cfg.beacon_pos
+        
+        # Get z from config (flying altitude)
+        z = cfg.drone1.initial.z if drone_id == 1 else cfg.drone2.initial.z
+        
+        # Calculate safe radius: between min_safe and inner_bound
+        min_safe_dist = flight.peer_close_m * 0.6  # Stay away from center a bit
+        max_dist = flight.inner_bound_m * 0.95  # Stay inside inner bound
+        
+        # For drone 2, we need to ensure it's not too close to drone 1
+        min_peer_dist = flight.peer_close_m * 1.2  # Start with safe margin from peer
+        
+        max_attempts = 100
+        for _ in range(max_attempts):
+            # Random distance from beacon
+            r = random.uniform(min_safe_dist, max_dist)
+            
+            # Random angle around beacon
+            theta = random.uniform(0, 2 * math.pi)
+            
+            x = beacon_x + r * math.cos(theta)
+            y = beacon_y + r * math.sin(theta)
+            
+            # Random yaw (heading)
+            yaw = random.uniform(-180, 180)
+            
+            # For drone 2, check distance to drone 1
+            if drone_id == 2 and self._random_initial_states[0] is not None:
+                d1 = self._random_initial_states[0]
+                dist_to_drone1 = math.sqrt((x - d1.x)**2 + (y - d1.y)**2)
+                if dist_to_drone1 < min_peer_dist:
+                    continue  # Too close, try again
+            
+            return DroneInitialState(x=x, y=y, z=z, yaw=yaw)
+        
+        # Fallback: if we couldn't find a good position, use config defaults
+        if drone_id == 1:
+            return cfg.drone1.initial
+        else:
+            return cfg.drone2.initial
+    
+    def randomize_initial_states(self) -> None:
+        """Generate random initial states for both drones."""
+        self._random_initial_states[0] = self._generate_random_initial_state(1)
+        self._random_initial_states[1] = self._generate_random_initial_state(2)
+
     def _init_drones(self) -> None:
         """Initialize drones and controllers with per-drone configurations."""
         cfg = self.config
@@ -146,7 +211,13 @@ class Simulator:
         
         for drone_id, drone_cfg in enumerate(drone_configs, start=1):
             noise = drone_cfg.noise
-            init = drone_cfg.initial
+            
+            # Use random initial state if set, otherwise use config
+            idx = drone_id - 1
+            if hasattr(self, '_random_initial_states') and self._random_initial_states[idx] is not None:
+                init = self._random_initial_states[idx]
+            else:
+                init = drone_cfg.initial
             
             # Select physics model based on noise configuration
             if noise.enable_process_noise:
@@ -154,7 +225,9 @@ class Simulator:
                     vx_std=noise.process_vx_std,
                     vy_std=noise.process_vy_std,
                     yaw_rate_std=noise.process_yaw_rate_std,
-                    vy_bias=noise.process_vy_bias
+                    vy_bias=noise.process_vy_bias,
+                    vy_bias_max=noise.process_vy_bias_max,
+                    vy_bias_walk_std=noise.process_vy_bias_walk_std
                 )
             else:
                 physics = KinematicPhysics()
@@ -289,6 +362,8 @@ class Simulator:
                 elif event.key == pygame.K_SPACE:
                     self.paused = not self.paused
                 elif event.key == pygame.K_r:
+                    # Randomize initial positions and reset
+                    self.randomize_initial_states()
                     self.reset()
                     for drone in self.drones:
                         drone.takeoff()
@@ -496,9 +571,11 @@ class Simulator:
         for i, (drone, ctrl) in enumerate(zip(self.drones, self.controllers)):
             color = drone_colors[i]
             
-            # Use avoidance color if avoiding
+            # Use special color for AVOID or DANCE states
             if ctrl.is_avoiding:
                 color = viz.avoidance_color
+            elif ctrl.is_dancing:
+                color = viz.dance_color
             
             # Draw trail
             if viz.show_trail and len(drone.trail) > 1:
@@ -555,7 +632,7 @@ class Simulator:
             lines.append(f"Drone {i+1}: {state_str} | {mode_str} | d0={d0:.2f}m | noise={noise_str}")
         
         lines.append("")
-        lines.append("[SPACE] Pause  [R] Reset  [ESC] Quit")
+        lines.append("[SPACE] Pause  [R] Random Reset  [ESC] Quit")
         
         if self.paused:
             lines.insert(0, "== PAUSED ==")

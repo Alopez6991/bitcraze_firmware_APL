@@ -101,8 +101,14 @@ class DroneNoiseParams:
     # Yaw rate noise std dev (deg/s)
     process_yaw_rate_std: float = 2.0
     
-    # Constant lateral drift (m/s) - set to 0 for no bias
+    # Initial lateral drift bias (m/s) - starting value for random walk
     process_vy_bias: float = 0.0
+    
+    # Maximum lateral drift (m/s) - bounds the random walk
+    process_vy_bias_max: float = 0.15
+    
+    # Random walk step std dev (m/s per update) - controls how fast bias changes
+    process_vy_bias_walk_std: float = 0.01
     
     # === Sensor Noise (UWB distance measurements) ===
     # Distance measurement noise std dev (meters)
@@ -158,6 +164,7 @@ class VisualizationParams:
     drone1_color: Tuple[int, int, int] = (0, 150, 255)
     drone2_color: Tuple[int, int, int] = (255, 100, 0)
     avoidance_color: Tuple[int, int, int] = (255, 0, 255)
+    dance_color: Tuple[int, int, int] = (255, 255, 0)  # Yellow for DANCE state
     text_color: Tuple[int, int, int] = (255, 255, 255)
     
     # Drone visual size in pixels
@@ -238,16 +245,16 @@ default_config = Config(
     # -------------------------------------------------------------------------
     drone1=DroneConfig(
         initial=DroneInitialState(
-            x=2.1,
-            y=-1.4800,
+            x=1.6,
+            y=-0.5,
             z=1.0,  # Flying altitude (meters)
-            yaw=-20.9322,
+            yaw=-170,
         ),
         noise=DroneNoiseParams(
-            enable_process_noise=False,
-            enable_sensor_noise=False,
+            enable_process_noise=True,
+            enable_sensor_noise=True,
             # Process noise
-            process_vx_std=0.02,
+            process_vx_std=0.01,
             process_vy_std=0.05,
             process_yaw_rate_std=2.0,
             process_vy_bias=0.05,
@@ -262,16 +269,16 @@ default_config = Config(
     # -------------------------------------------------------------------------
     drone2=DroneConfig(
         initial=DroneInitialState(
-            x=-0.5853,
-            y=0.1837,
+            x=-0.5,
+            y=0.3,
             z=1.0,  # Flying altitude (meters)
             yaw=-10.2283,
         ),
         noise=DroneNoiseParams(
-            enable_process_noise=False,
-            enable_sensor_noise=False,
+            enable_process_noise=True,
+            enable_sensor_noise=True,
             # Process noise
-            process_vx_std=0.02,
+            process_vx_std=0.01,
             process_vy_std=0.05,
             process_yaw_rate_std=2.0,
             process_vy_bias=0.0,

@@ -112,6 +112,7 @@ class NoisyKinematicPhysics:
     
     Models imperfect velocity tracking due to estimation errors.
     Noise is added to the commanded velocities before integration.
+    The lateral velocity bias follows a random walk with bounds.
     """
     
     def __init__(
@@ -119,7 +120,9 @@ class NoisyKinematicPhysics:
         vx_std: float = 0.02,
         vy_std: float = 0.05,
         yaw_rate_std: float = 2.0,
-        vy_bias: float = 0.0
+        vy_bias: float = 0.0,
+        vy_bias_max: float = 0.15,
+        vy_bias_walk_std: float = 0.005
     ):
         """
         Initialize noisy physics model.
@@ -128,12 +131,16 @@ class NoisyKinematicPhysics:
             vx_std: Forward velocity noise std dev (m/s)
             vy_std: Lateral velocity noise std dev (m/s)
             yaw_rate_std: Yaw rate noise std dev (deg/s)
-            vy_bias: Constant lateral velocity bias (m/s)
+            vy_bias: Initial lateral velocity bias (m/s)
+            vy_bias_max: Maximum absolute value for vy_bias random walk (m/s)
+            vy_bias_walk_std: Std dev for random walk step per update (m/s)
         """
         self.vx_std = vx_std
         self.vy_std = vy_std
         self.yaw_rate_std = yaw_rate_std
         self.vy_bias = vy_bias
+        self.vy_bias_max = vy_bias_max
+        self.vy_bias_walk_std = vy_bias_walk_std
     
     def update(
         self,
@@ -156,6 +163,10 @@ class NoisyKinematicPhysics:
         Returns:
             New physics state
         """
+        # Update vy_bias with random walk (bounded)
+        self.vy_bias += random.gauss(0, self.vy_bias_walk_std)
+        self.vy_bias = max(-self.vy_bias_max, min(self.vy_bias_max, self.vy_bias))
+        
         # Add process noise to commands (in body frame)
         noisy_vx = cmd_vx_body + random.gauss(0, self.vx_std)
         noisy_vy = cmd_vy_body + random.gauss(0, self.vy_std) + self.vy_bias

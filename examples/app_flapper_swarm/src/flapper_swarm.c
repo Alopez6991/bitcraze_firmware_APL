@@ -50,9 +50,11 @@ static float targetHeightM = 1.0f;
 static float fwdSpeedMps = 0.5f;
 static uint16_t dist0AbortMm = 4200U;        // outer emergency bound to beacon (mm)
 static uint16_t innerBoundMm = 1750U;        // Inner bound to start turning
+static uint16_t innerBoundHysteresisMm = 100U; // Hysteresis: exit TURN when d0 <= innerBoundMm - hysteresis
 static float turnYawRateDps = 40.0f;         // Yaw rate while turning (deg/s)
 static uint16_t peerCloseMm = 2000U;         // near-limit on peer distance (2m)
 static uint8_t abortConfirmCount = 2;        // Require N consecutive samples to trigger thresholds
+static uint8_t turnExitConfirmCount = 4;     // Require more samples to exit TURN (reduce noise-triggered exits)
 static uint8_t avoidEnterConfirmCount = 2;
 static uint8_t avoidExitConfirmCount = 4;
 static uint16_t avoidMinLandMm = 600U;       // Drone min land distance
@@ -86,10 +88,11 @@ static uint32_t demoTimeMs = 60000U;         // time of the demo in ms
 #define REJOIN_CONFIRM_COUNT 3
 
 // UTURN state constants
-#define MIDDLE_BOUND_OFFSET_MM 500U         // Middle bound = dist0AbortMm - 250mm
+#define MIDDLE_BOUND_OFFSET_MM 400U         // Middle bound = dist0AbortMm - 200mm
 #define UTURN_CONFIRM_COUNT 2               // Samples to confirm middle bound exceeded
 #define UTURN_YAW_RATE_DPS 60.0f            // Yaw rate for 180° turn (deg/s)
 #define UTURN_YAW_TOLERANCE 5.0f            // Degrees tolerance for completing turn
+#define UTURN_FLY_MIN_TIME_MS 2000U         // Minimum time in UTURN_FLY before allowing re-entry to UTURN
 
 // ============================================================================
 // Log variable IDs
@@ -156,6 +159,7 @@ static bool uturnUsed = false;              // One-shot flag: true after UTURN h
 static float uturnYawStart = 0.0f;          // Yaw at start of UTURN
 static float uturnTargetYaw = 0.0f;         // Target yaw (180° from start)
 static bool uturnActive = false;            // Whether we're actively tracking the 180° turn
+static uint32_t uturnFlyEntryTime = 0;      // Timestamp when UTURN_FLY was entered
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
@@ -355,7 +359,6 @@ static void sendHover(float vx, float vy, float z, float yawRateDeg) {
   sp.velocity_body = true;
   sp.velocity.x = vx;
   sp.velocity.y = vy;
-
   sp.mode.yaw = modeVelocity;
   sp.attitudeRate.yaw = yawRateDeg;
 
@@ -508,6 +511,12 @@ static void rampToHeight(float zTarget, uint32_t rampMs) {
     sendHover(0.0f, 0.0f, z, 0.0f);
     vTaskDelay(pdMS_TO_TICKS(dtMs));
   }
+  for (uint32_t i = 0; i <= 100; i++) { // hover for a bit before starting the demo.
+    if (checkKillAndDisarm()) return;
+    if (checkAndMaybeEmergencyLand()) return;
+    sendHover(0.0f, 0.0f, zTarget, 0.0f);
+    vTaskDelay(pdMS_TO_TICKS(dtMs));
+  }
 }
 
 // ============================================================================
@@ -576,7 +585,7 @@ static void executeStraight(void) {
 static void onEnterTurn(void) {
   innerUnderCount = 0;
   ctx.arcYawStart = logGetFloat(idYaw);
-  ctx.targetYaw = normalizeAngle(ctx.arcYawStart - 110.0f);
+  ctx.targetYaw = normalizeAngle(ctx.arcYawStart - 130.0f);
   ctx.arcActive = isfinite(ctx.arcYawStart);
   DEBUG_PRINT("[%.2f] Enter TURN: arcActive=%d, startYaw=%.3f deg, targetYaw=%.3f deg\n",
               (double)getTimestamp(), ctx.arcActive ? 1 : 0, (double)ctx.arcYawStart, (double)ctx.targetYaw);
@@ -592,12 +601,20 @@ static FlightState checkTransitionTurn(void) {
     DEBUG_PRINT("[%.2f] TURN -> AVOID: peer too close\n", (double)getTimestamp());
     return STATE_AVOID;
   }
+
+  // TURN -> UTURN: approaching outer bound (one-shot emergency turn)
+  if (shouldEnterUturn()) {
+    DEBUG_PRINT("[%.2f] STRAIGHT -> UTURN: middle bound exceeded (d0=%lu >= %u)\n",
+                (double)getTimestamp(), (unsigned long)ctx.d0, getMiddleBoundMm());
+    return STATE_UTURN;
+  }
   
   // TURN -> STRAIGHT: back inside inner bound
   if (ctx.d0 <= innerBoundMm) {
     if (++innerUnderCount >= abortConfirmCount) {
       ctx.routines++;
-      DEBUG_PRINT("[%.2f] TURN -> STRAIGHT: routine %u complete (d0=%lu)\n", (double)getTimestamp(), ctx.routines, (unsigned long)ctx.d0);
+      DEBUG_PRINT("[%.2f] TURN -> STRAIGHT: routine %u complete (d0=%lu, deriv=%.1f)\n", 
+                  (double)getTimestamp(), ctx.routines, (unsigned long)ctx.d0, (double)ctx.d0Deriv);
       return STATE_STRAIGHT;
     }
   } else {
@@ -631,8 +648,12 @@ static FlightState checkTransitionTurn(void) {
 }
 
 static void executeTurn(void) {
-
-  sendHover(fwdSpeedMps, 0.0f*fwdSpeedMps, targetHeightM, turnYawRateDps);
+  float yawRateCmd = turnYawRateDps;
+  if (ctx.d0Deriv < -50.0f) {
+    yawRateCmd *= 0.5f;
+  }
+  DEBUG_PRINT("[%.2f] TURN: d0Deriv=%.2f, yawRateCmd=%.2f\n", (double)getTimestamp(), (double)ctx.d0Deriv, (double)yawRateCmd);
+  sendHover(fwdSpeedMps, 0.0f*fwdSpeedMps, targetHeightM, yawRateCmd);
 }
 
 // --- AVOID state ---
@@ -680,7 +701,7 @@ static void onEnterRecover(void) {
   recoverDebugCounter = 0;  // Reset debug counter on entry
   middleBoundOverCount = 0;  // Reset UTURN confirmation counter
   if (droneId != 1) {
-    if (ctx.d0 > dist0AbortMm - 800) { // subject to tuning
+    if ((prevState == STATE_AVOID) && (ctx.d0 > dist0AbortMm - 800)) { // subject to tuning
       DEBUG_PRINT("[%.2f] Keeping direction after avoid\n", (double)getTimestamp());
       ctx.rotationDirection = -1;
     }
@@ -727,7 +748,7 @@ static void executeRecover(void) {
   float yawCommandFinal = yawCommand * ctx.rotationDirection;
   
   // Throttled debug output
-  if (++recoverDebugCounter >= 10) {
+  if (++recoverDebugCounter >= 25) {
     recoverDebugCounter = 0;
     DEBUG_PRINT("[%.2f] RECOVER: d0=%lu innerB=%u | deriv=%.1f desDeriv=%.1f | yawRaw=%.1f yawFinal=%.1f rotDir=%d\n",
                 (double)getTimestamp(), (unsigned long)ctx.d0, innerBoundMm,
@@ -855,7 +876,7 @@ static void onEnterUturn(void) {
   
   // Capture starting yaw and compute target (180° turn)
   uturnYawStart = logGetFloat(idYaw);
-  uturnTargetYaw = normalizeAngle(uturnYawStart + 180.0f);
+  uturnTargetYaw = normalizeAngle(uturnYawStart + 130.0f);
   uturnActive = isfinite(uturnYawStart);
   
   middleBoundOverCount = 0;
@@ -916,11 +937,14 @@ static void executeUturn(void) {
 
 // --- UTURN_FLY state (flying straight back after 180° turn) ---
 static void onEnterUturnFly(void) {
+  uturnFlyEntryTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  middleBoundOverCount = 0;  // Reset confirmation counter for potential re-entry
   DEBUG_PRINT("[%.2f] Enter UTURN_FLY (drone %u): flying straight, hoping to reach inner bound\n",
               (double)getTimestamp(), droneId);
 }
 
 static void onExitUturnFly(void) {
+  uturnUsed = false;
   DEBUG_PRINT("[%.2f] Exit UTURN_FLY (drone %u)\n", (double)getTimestamp(), droneId);
 }
 
@@ -936,6 +960,21 @@ static FlightState checkTransitionUturnFly(void) {
     DEBUG_PRINT("[%.2f] UTURN_FLY -> STRAIGHT: made it back! (d0=%lu <= %u)\n",
                 (double)getTimestamp(), (unsigned long)ctx.d0, innerBoundMm);
     return STATE_STRAIGHT;
+  }
+  
+  // UTURN_FLY -> UTURN: hit middle bound again after minimum time (allow retry)
+  uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  if ((now - uturnFlyEntryTime) >= UTURN_FLY_MIN_TIME_MS) {
+    const uint16_t middleBound = getMiddleBoundMm();
+    if (ctx.d0 >= middleBound && ctx.d0 < dist0AbortMm) {
+      if (++middleBoundOverCount >= UTURN_CONFIRM_COUNT) {
+        DEBUG_PRINT("[%.2f] UTURN_FLY -> UTURN: middle bound exceeded again (d0=%lu >= %u)\n",
+                    (double)getTimestamp(), (unsigned long)ctx.d0, middleBound);
+        return STATE_UTURN;
+      }
+    } else {
+      middleBoundOverCount = 0;
+    }
   }
   
   // If we hit outer bound, emergency land will be triggered by checkAndMaybeEmergencyLand()
@@ -1093,6 +1132,7 @@ static void runSequence(void) {
   } else {
     DEBUG_PRINT("[%.2f] Finished demo in approx %u routines\n", (double)getTimestamp(), ctx.routines);
   }
+  commanderRelaxPriority();
 }
 
 // ============================================================================
@@ -1125,10 +1165,10 @@ static void setVelocityControllerGains(void) {
   if (PARAM_VARID_IS_VALID(vxKpId)) paramSetFloat(vxKpId, 20.0f);
 
   // Set Y velocity gains
-  if (PARAM_VARID_IS_VALID(vyKFFId)) paramSetFloat(vyKFFId, 8.0f);
+  if (PARAM_VARID_IS_VALID(vyKFFId)) paramSetFloat(vyKFFId, 4.0f);
   if (PARAM_VARID_IS_VALID(vyKdId)) paramSetFloat(vyKdId, 0.0f);
-  if (PARAM_VARID_IS_VALID(vyKiId)) paramSetFloat(vyKiId, 5.0f);
-  if (PARAM_VARID_IS_VALID(vyKpId)) paramSetFloat(vyKpId, 12.0f);
+  if (PARAM_VARID_IS_VALID(vyKiId)) paramSetFloat(vyKiId, 15.0f);
+  if (PARAM_VARID_IS_VALID(vyKpId)) paramSetFloat(vyKpId, 30.0f);
 
   // Set Z velocity gains
   if (PARAM_VARID_IS_VALID(vzKFFId)) paramSetFloat(vzKFFId, 0.0f);
@@ -1219,9 +1259,11 @@ PARAM_GROUP_START(swarm)
   PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, fwdSpeed, &fwdSpeedMps)
   PARAM_ADD(PARAM_UINT16 | PARAM_PERSISTENT, dist0Abort, &dist0AbortMm)
   PARAM_ADD(PARAM_UINT16 | PARAM_PERSISTENT, innerBound, &innerBoundMm)
+  PARAM_ADD(PARAM_UINT16 | PARAM_PERSISTENT, innerHyst, &innerBoundHysteresisMm)
   PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, turnYawRate, &turnYawRateDps)
   PARAM_ADD(PARAM_UINT16 | PARAM_PERSISTENT, peerClose, &peerCloseMm)
   PARAM_ADD(PARAM_UINT8 | PARAM_PERSISTENT, abortConfirm, &abortConfirmCount)
+  PARAM_ADD(PARAM_UINT8 | PARAM_PERSISTENT, turnExitCfm, &turnExitConfirmCount)
   PARAM_ADD(PARAM_UINT8 | PARAM_PERSISTENT, avoidEnter, &avoidEnterConfirmCount)
   PARAM_ADD(PARAM_UINT8 | PARAM_PERSISTENT, avoidExit, &avoidExitConfirmCount)
   PARAM_ADD(PARAM_UINT16 | PARAM_PERSISTENT, avoidMinLand, &avoidMinLandMm)

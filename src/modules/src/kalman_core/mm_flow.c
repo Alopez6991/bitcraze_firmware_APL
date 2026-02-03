@@ -25,8 +25,20 @@
 
 #include "mm_flow.h"
 #include "log.h"
+#include "param.h"
 
 #define FLOW_RESOLUTION 0.10f //We do get the measurements in 10x the motion pixels (experimentally measured)
+
+// ============================================================================
+// Gyro low-pass filter for oscillating platforms (e.g., flappers)
+// ============================================================================
+static Axis3f gyroFiltered = {0};
+static bool gyroFilterInitialized = false;
+
+// Filter time constant in seconds. Set to 0 to disable filtering.
+// For 20-30 Hz oscillations, tau = 0.03-0.04s gives good attenuation.
+// f_c = 1/(2*pi*tau), e.g. tau=0.03 -> f_c ~5Hz, attenuates 25Hz by ~80%
+static float gyroFilterTauS = 0.0f;
 
 // TODO remove the temporary test variables (used for logging)
 static float predictedNX;
@@ -37,6 +49,30 @@ static float measuredNY;
 void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *flow, const Axis3f *gyro, const bool isFlying)
 {
   // Inclusion of flow measurements in the EKF done by two scalar updates
+  
+  // ~~~ Gyro filtering for oscillating platforms ~~~
+  // Apply low-pass filter to gyro to match flow sensor integration behavior
+  // and attenuate high-frequency oscillations (e.g., 20-30 Hz flapping)
+  Axis3f gyroToUse;
+  
+  if (gyroFilterTauS > 0.0f) {
+    if (!gyroFilterInitialized) {
+      gyroFiltered = *gyro;
+      gyroFilterInitialized = true;
+    } else {
+      // EMA: alpha = dt / tau (clamped to 1.0)
+      float alpha = flow->dt / gyroFilterTauS;
+      if (alpha > 1.0f) alpha = 1.0f;
+      
+      gyroFiltered.x += alpha * (gyro->x - gyroFiltered.x);
+      gyroFiltered.y += alpha * (gyro->y - gyroFiltered.y);
+      gyroFiltered.z += alpha * (gyro->z - gyroFiltered.z);
+    }
+    gyroToUse = gyroFiltered;
+  } else {
+    // No filtering, use raw gyro (default, matches stock firmware)
+    gyroToUse = *gyro;
+  }
 
   // ~~~ Camera constants ~~~
   // The angle of aperture is guessed from the raw data register and thankfully look to be symmetric
@@ -44,9 +80,9 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   //float thetapix = DEG_TO_RAD * 4.0f;     // [rad]    (same in x and y)
   float thetapix = 0.71674f;// 2*sin(42/2); 42degree is the agnle of aperture, here we computed the corresponding ground length
   //~~~ Body rates ~~~
-  // TODO check if this is feasible or if some filtering has to be done
-  float omegax_b = gyro->x * DEG_TO_RAD;
-  float omegay_b = gyro->y * DEG_TO_RAD;
+  // Use filtered gyro for flow prediction
+  float omegax_b = gyroToUse.x * DEG_TO_RAD;
+  float omegay_b = gyroToUse.y * DEG_TO_RAD;
 
   // ~~~ Moves the body velocity into the global coordinate system ~~~
   // [bar{x},bar{y},bar{z}]_G = R*[bar{x},bar{y},bar{z}]_B
@@ -143,3 +179,19 @@ LOG_GROUP_START(kalman_pred)
  */
   LOG_ADD(LOG_FLOAT, measNY, &measuredNY)
 LOG_GROUP_STOP(kalman_pred)
+
+/**
+ * Parameters for gyro filtering in flow prediction
+ */
+PARAM_GROUP_START(flowFilter)
+/**
+ * @brief Gyro low-pass filter time constant in seconds
+ * 
+ * For oscillating platforms (flappers), set to 0.03-0.04s to attenuate
+ * 20-30 Hz body oscillations. This improves flow prediction accuracy
+ * by matching the gyro signal to what the flow sensor integrates.
+ * f_c = 1/(2*pi*tau), e.g. tau=0.03 -> f_c ~5Hz
+ * Set to 0 to disable filtering (default, matches stock firmware).
+ */
+  PARAM_ADD(PARAM_FLOAT, gyroTauS, &gyroFilterTauS)
+PARAM_GROUP_STOP(flowFilter)

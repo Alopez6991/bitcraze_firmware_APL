@@ -96,7 +96,7 @@ static uint32_t validFlowCount = 0;
 // Settings
 static bool useFlowDisabled = false;
 static bool useRangeDisabled = false;
-static float flowStdFixed = 2.0f;
+static float flowStdFixed = 1.5f;
 static float flowScale = 1.0f;  // Scaling factor for flow measurements (tune if drift occurs)
 
 /**
@@ -262,7 +262,7 @@ static void processOpticalFlowMessage(msp_msg_t* msg, uint64_t* lastTime)
             
             flowMeasurement_t flowData;
             flowData.stdDevX = flowStdFixed;
-            flowData.stdDevY = flowStdFixed;
+            flowData.stdDevY = flowStdFixed * 2;
             flowData.dt = (float)(usecTimestamp() - *lastTime) / 1000000.0f;
             *lastTime = usecTimestamp();
 
