@@ -409,6 +409,8 @@ static void updateQueuedMeasurements(const uint32_t nowMs, const bool quadIsFlyi
       case MeasurementTypeGyroscope:
         axis3fSubSamplerAccumulate(&gyroSubSampler, &m.data.gyroscope.gyro);
         gyroLatest = m.data.gyroscope.gyro;
+        // Add to gyro history for flow delay compensation
+        mmFlowAddGyroSample(&m.data.gyroscope.gyro, nowMs);
         break;
       case MeasurementTypeAcceleration:
         axis3fSubSamplerAccumulate(&accSubSampler, &m.data.acceleration.acc);

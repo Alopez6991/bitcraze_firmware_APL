@@ -67,7 +67,7 @@ static uint32_t demoTimeMs = 60000U;         // time of the demo in ms
 // ============================================================================
 #define RAMP_TIME_MS 1500U
 #define LAND_VZ_MPS 0.4f            // descent speed
-#define CUT_Z_M 0.05f               // cut controllers below this altitude
+#define CUT_Z_M 0.04f               // cut controllers below this altitude
 #define DERIV_SAMPLE_INTERVAL_MS 10
 #define D0_BUFFER_SIZE 15
 #define DES_DERIV -1200.0f          // desired derivative wrt middle beacon

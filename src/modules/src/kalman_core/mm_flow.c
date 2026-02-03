@@ -26,19 +26,70 @@
 #include "mm_flow.h"
 #include "log.h"
 #include "param.h"
+#include "FreeRTOS.h"
+#include "task.h"
 
 #define FLOW_RESOLUTION 0.10f //We do get the measurements in 10x the motion pixels (experimentally measured)
 
 // ============================================================================
-// Gyro low-pass filter for oscillating platforms (e.g., flappers)
+// Gyro history buffer for delay compensation
 // ============================================================================
-static Axis3f gyroFiltered = {0};
-static bool gyroFilterInitialized = false;
+#define GYRO_HISTORY_SIZE 32
 
-// Filter time constant in seconds. Set to 0 to disable filtering.
-// For 20-30 Hz oscillations, tau = 0.03-0.04s gives good attenuation.
-// f_c = 1/(2*pi*tau), e.g. tau=0.03 -> f_c ~5Hz, attenuates 25Hz by ~80%
-static float gyroFilterTauS = 0.0f;
+typedef struct {
+  Axis3f gyro;
+  uint32_t timestamp;  // ms
+} GyroHistoryEntry;
+
+static GyroHistoryEntry gyroHistory[GYRO_HISTORY_SIZE];
+static uint8_t gyroHistoryIdx = 0;
+static bool gyroHistoryFull = false;
+
+// Configurable delay compensation (ms)
+static float flowDelayMs = 30.0f;
+
+// Add a gyro sample to history
+void mmFlowAddGyroSample(const Axis3f *gyro, uint32_t timestampMs) {
+  gyroHistory[gyroHistoryIdx].gyro = *gyro;
+  gyroHistory[gyroHistoryIdx].timestamp = timestampMs;
+  gyroHistoryIdx = (gyroHistoryIdx + 1) % GYRO_HISTORY_SIZE;
+  if (gyroHistoryIdx == 0) {
+    gyroHistoryFull = true;
+  }
+}
+
+// Get the gyro reading from a specific time ago (with interpolation)
+static Axis3f getGyroAtDelay(float delayMs, const Axis3f *currentGyro) {
+  if (!gyroHistoryFull && gyroHistoryIdx == 0) {
+    // No history yet, use current
+    return *currentGyro;
+  }
+
+  uint32_t now = xTaskGetTickCount();
+  uint32_t targetTime = now - (uint32_t)delayMs;
+
+  // Search for closest sample
+  uint8_t count = gyroHistoryFull ? GYRO_HISTORY_SIZE : gyroHistoryIdx;
+  int bestIdx = -1;
+  uint32_t bestDiff = UINT32_MAX;
+
+  for (uint8_t i = 0; i < count; i++) {
+    uint32_t diff = (gyroHistory[i].timestamp > targetTime) ? 
+                    (gyroHistory[i].timestamp - targetTime) : 
+                    (targetTime - gyroHistory[i].timestamp);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIdx = i;
+    }
+  }
+
+  if (bestIdx >= 0 && bestDiff < 50) {  // Only use if within 50ms
+    return gyroHistory[bestIdx].gyro;
+  }
+
+  // Fallback to current
+  return *currentGyro;
+}
 
 // TODO remove the temporary test variables (used for logging)
 static float predictedNX;
@@ -50,28 +101,12 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
 {
   // Inclusion of flow measurements in the EKF done by two scalar updates
   
-  // ~~~ Gyro filtering for oscillating platforms ~~~
-  // Apply low-pass filter to gyro to match flow sensor integration behavior
-  // and attenuate high-frequency oscillations (e.g., 20-30 Hz flapping)
-  Axis3f gyroToUse;
-  
-  if (gyroFilterTauS > 0.0f) {
-    if (!gyroFilterInitialized) {
-      gyroFiltered = *gyro;
-      gyroFilterInitialized = true;
-    } else {
-      // EMA: alpha = dt / tau (clamped to 1.0)
-      float alpha = flow->dt / gyroFilterTauS;
-      if (alpha > 1.0f) alpha = 1.0f;
-      
-      gyroFiltered.x += alpha * (gyro->x - gyroFiltered.x);
-      gyroFiltered.y += alpha * (gyro->y - gyroFiltered.y);
-      gyroFiltered.z += alpha * (gyro->z - gyroFiltered.z);
-    }
-    gyroToUse = gyroFiltered;
+  // Get historical gyro if delay compensation is enabled
+  Axis3f gyroCompensated;
+  if (flowDelayMs > 0.0f) {
+    gyroCompensated = getGyroAtDelay(flowDelayMs, gyro);
   } else {
-    // No filtering, use raw gyro (default, matches stock firmware)
-    gyroToUse = *gyro;
+    gyroCompensated = *gyro;
   }
 
   // ~~~ Camera constants ~~~
@@ -80,9 +115,9 @@ void kalmanCoreUpdateWithFlow(kalmanCoreData_t* this, const flowMeasurement_t *f
   //float thetapix = DEG_TO_RAD * 4.0f;     // [rad]    (same in x and y)
   float thetapix = 0.71674f;// 2*sin(42/2); 42degree is the agnle of aperture, here we computed the corresponding ground length
   //~~~ Body rates ~~~
-  // Use filtered gyro for flow prediction
-  float omegax_b = gyroToUse.x * DEG_TO_RAD;
-  float omegay_b = gyroToUse.y * DEG_TO_RAD;
+  // Use delay-compensated gyro for flow prediction
+  float omegax_b = gyroCompensated.x * DEG_TO_RAD;
+  float omegay_b = gyroCompensated.y * DEG_TO_RAD;
 
   // ~~~ Moves the body velocity into the global coordinate system ~~~
   // [bar{x},bar{y},bar{z}]_G = R*[bar{x},bar{y},bar{z}]_B
@@ -181,17 +216,16 @@ LOG_GROUP_START(kalman_pred)
 LOG_GROUP_STOP(kalman_pred)
 
 /**
- * Parameters for gyro filtering in flow prediction
+ * Parameters for flow delay compensation
  */
-PARAM_GROUP_START(flowFilter)
+PARAM_GROUP_START(motion)
 /**
- * @brief Gyro low-pass filter time constant in seconds
+ * @brief Flow sensor delay compensation in milliseconds
  * 
- * For oscillating platforms (flappers), set to 0.03-0.04s to attenuate
- * 20-30 Hz body oscillations. This improves flow prediction accuracy
- * by matching the gyro signal to what the flow sensor integrates.
- * f_c = 1/(2*pi*tau), e.g. tau=0.03 -> f_c ~5Hz
- * Set to 0 to disable filtering (default, matches stock firmware).
+ * Set to the estimated delay between when the flow sensor captures
+ * the image and when the measurement is processed by the EKF.
+ * This uses historical gyro data to improve the prediction.
+ * Set to 0 to disable delay compensation.
  */
-  PARAM_ADD(PARAM_FLOAT, gyroTauS, &gyroFilterTauS)
-PARAM_GROUP_STOP(flowFilter)
+  PARAM_ADD(PARAM_FLOAT | PARAM_PERSISTENT, delayMs, &flowDelayMs)
+PARAM_GROUP_STOP(motion)
