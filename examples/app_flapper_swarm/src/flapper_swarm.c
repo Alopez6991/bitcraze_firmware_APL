@@ -88,7 +88,7 @@ static uint32_t demoTimeMs = 60000U;         // time of the demo in ms
 #define REJOIN_CONFIRM_COUNT 3
 
 // UTURN state constants
-#define MIDDLE_BOUND_OFFSET_MM 400U         // Middle bound = dist0AbortMm - 200mm
+#define MIDDLE_BOUND_OFFSET_MM 400U         // Middle bound = dist0AbortMm - 400mm
 #define UTURN_CONFIRM_COUNT 2               // Samples to confirm middle bound exceeded
 #define UTURN_YAW_RATE_DPS 60.0f            // Yaw rate for 180° turn (deg/s)
 #define UTURN_YAW_TOLERANCE 5.0f            // Degrees tolerance for completing turn
@@ -155,11 +155,11 @@ static bool danceHasTakenOff = false; // Drone 1: tracks if we've completed take
 
 // UTURN state variables
 static uint8_t middleBoundOverCount = 0;    // Confirmation counter for middle bound
-static bool uturnUsed = false;              // One-shot flag: true after UTURN has been attempted
 static float uturnYawStart = 0.0f;          // Yaw at start of UTURN
 static float uturnTargetYaw = 0.0f;         // Target yaw (180° from start)
 static bool uturnActive = false;            // Whether we're actively tracking the 180° turn
 static uint32_t uturnFlyEntryTime = 0;      // Timestamp when UTURN_FLY was entered
+static uint32_t uturnCooldownEndTime = 0;   // Timestamp when UTURN cooldown ends
 
 // Sequence abort flag set by emergency check
 static volatile bool seqAbort = false;
@@ -170,6 +170,8 @@ static const float recoverFactor = - ( RECOVER_YAWRATE / DES_DERIV);
 // ============================================================================
 // Derivative buffer for d0
 // ============================================================================
+#define PEER_BUFFER_SIZE 15
+
 typedef struct {
   uint32_t samples[D0_BUFFER_SIZE];
   uint8_t writeIndex;
@@ -178,6 +180,18 @@ typedef struct {
 } D0Buffer;
 
 static D0Buffer d0Buffer;
+
+// ============================================================================
+// Derivative buffer for peer distance (used in AVOID state)
+// ============================================================================
+typedef struct {
+  uint32_t samples[PEER_BUFFER_SIZE];
+  uint8_t writeIndex;
+  uint8_t count;
+  uint32_t lastSampleTime;
+} PeerDistBuffer;
+
+static PeerDistBuffer peerDistBuffer;
 
 static void d0BufferReset(void) {
   memset(&d0Buffer, 0, sizeof(d0Buffer));
@@ -237,6 +251,66 @@ static float d0BufferGetDerivative(void) {
 }
 
 // ============================================================================
+// Peer distance buffer functions (for AVOID state derivative)
+// ============================================================================
+static void peerDistBufferReset(void) {
+  memset(&peerDistBuffer, 0, sizeof(peerDistBuffer));
+}
+
+static void peerDistBufferAdd(uint32_t peerDist, uint32_t now) {
+  if ((now - peerDistBuffer.lastSampleTime) >= DERIV_SAMPLE_INTERVAL_MS) {
+    peerDistBuffer.samples[peerDistBuffer.writeIndex] = peerDist;
+    peerDistBuffer.writeIndex = (peerDistBuffer.writeIndex + 1) % PEER_BUFFER_SIZE;
+    if (peerDistBuffer.count < PEER_BUFFER_SIZE) {
+      peerDistBuffer.count++;
+    }
+    peerDistBuffer.lastSampleTime = now;
+  }
+}
+
+// Compute derivative using linear regression (least squares fit)
+// Returns derivative in mm/s, positive = moving apart, negative = moving closer
+static float peerDistBufferGetDerivative(void) {
+  if (peerDistBuffer.count < 2) {
+    return 0.0f;
+  }
+  
+  uint8_t n = peerDistBuffer.count;
+  
+  float sumT = 0.0f;
+  float sumY = 0.0f;
+  float sumTY = 0.0f;
+  float sumT2 = 0.0f;
+  
+  for (uint8_t i = 0; i < n; i++) {
+    uint8_t idx;
+    if (peerDistBuffer.count < PEER_BUFFER_SIZE) {
+      idx = i;
+    } else {
+      idx = (peerDistBuffer.writeIndex + i) % PEER_BUFFER_SIZE;
+    }
+    
+    float t = (float)i;
+    float y = (float)peerDistBuffer.samples[idx];
+    
+    sumT += t;
+    sumY += y;
+    sumTY += t * y;
+    sumT2 += t * t;
+  }
+  
+  float denom = (float)n * sumT2 - sumT * sumT;
+  if (fabsf(denom) < 1e-6f) {
+    return 0.0f;
+  }
+  
+  float slopePerInterval = ((float)n * sumTY - sumT * sumY) / denom;
+  float intervalS = (float)DERIV_SAMPLE_INTERVAL_MS / 1000.0f;
+  
+  return slopePerInterval / intervalS;
+}
+
+// ============================================================================
 // State machine context (shared between state handlers)
 // ============================================================================
 typedef struct {
@@ -253,6 +327,8 @@ typedef struct {
   // Current sensor readings (updated each loop)
   uint32_t d0;
   float d0Deriv;
+  uint32_t peerDist;
+  float peerDistDeriv;
 } StateContext;
 
 static StateContext ctx;
@@ -451,8 +527,9 @@ static inline uint16_t getMiddleBoundMm(void) {
 }
 
 static bool shouldEnterUturn(void) {
-  // Only allow UTURN once per flight sequence
-  if (uturnUsed) {
+  // Check cooldown - can't enter UTURN until cooldown expires
+  uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+  if (now < uturnCooldownEndTime) {
     return false;
   }
   
@@ -675,6 +752,13 @@ static FlightState checkTransitionAvoid(void) {
                 (double)getTimestamp(), (unsigned long)getPeerDistance(), avoidMinLandMm);
     return STATE_DANCE;
   }
+
+  // AVOID -> UTURN: approaching outer bound (emergency turn)
+  if (shouldEnterUturn()) {
+    DEBUG_PRINT("[%.2f] AVOID -> UTURN: middle bound exceeded (d0=%lu >= %u)\n",
+                (double)getTimestamp(), (unsigned long)ctx.d0, getMiddleBoundMm());
+    return STATE_UTURN;
+  }
   
   // AVOID -> STRAIGHT or RECOVER: peer far enough
   if (shouldExitAvoid()) {
@@ -691,7 +775,13 @@ static FlightState checkTransitionAvoid(void) {
 }
 
 static void executeAvoid(void) {
-  sendHover(fwdSpeedMps * avoidSpeedFactor, 0.0f, targetHeightM, getAvoidYawRate());
+  // If derivative is positive (drones moving apart), use half yaw rate
+  // to prevent excessive circling when drones are already separating
+  float yawRate = getAvoidYawRate();
+  if (ctx.peerDistDeriv > 50.0f) {
+    yawRate *= 0.5f;
+  }
+  sendHover(fwdSpeedMps * avoidSpeedFactor, 0.0f, targetHeightM, yawRate);
 }
 
 // --- RECOVER state ---
@@ -871,8 +961,8 @@ static void executeDance(void) {
 static void onEnterUturn(void) {
   DEBUG_PRINT("[%.2f] Enter UTURN (drone %u)\n", (double)getTimestamp(), droneId);
   
-  // Mark UTURN as used (one-shot)
-  uturnUsed = true;
+  // Set cooldown end time (2 seconds from now)
+  uturnCooldownEndTime = (xTaskGetTickCount() * portTICK_PERIOD_MS) + 2000;
   
   // Capture starting yaw and compute target (180° turn)
   uturnYawStart = logGetFloat(idYaw);
@@ -893,9 +983,15 @@ static void onExitUturn(void) {
 
 static FlightState checkTransitionUturn(void) {
   // UTURN -> AVOID: peer too close (safety override)
-  if (shouldEnterAvoid()) {
-    DEBUG_PRINT("[%.2f] UTURN -> AVOID: peer too close\n", (double)getTimestamp());
-    return STATE_AVOID;
+  // if (shouldEnterAvoid()) {
+  //   DEBUG_PRINT("[%.2f] UTURN -> AVOID: peer too close\n", (double)getTimestamp());
+  //   return STATE_AVOID;
+  // }
+  // UTURN -> DANCE: peer dangerously close (safety override)
+  if (shouldEnterDance()) {
+    DEBUG_PRINT("[%.2f] Uturn -> DANCE: peer in danger zone (dist=%lu <= %u)\n",
+                (double)getTimestamp(), (unsigned long)getPeerDistance(), avoidMinLandMm);
+    return STATE_DANCE;
   }
   
   // Check if 180° turn complete
@@ -944,7 +1040,7 @@ static void onEnterUturnFly(void) {
 }
 
 static void onExitUturnFly(void) {
-  uturnUsed = false;
+  // Cooldown is time-based from onEnterUturn, no need to reset here
   DEBUG_PRINT("[%.2f] Exit UTURN_FLY (drone %u)\n", (double)getTimestamp(), droneId);
 }
 
@@ -1051,15 +1147,16 @@ static void runSequence(void) {
   peerLandedCount = 0;
   rejoinCount = 0;
   middleBoundOverCount = 0;
-  uturnUsed = false;          // Reset one-shot flag for new sequence
+  uturnCooldownEndTime = 0;   // Reset cooldown for new sequence
   uturnActive = false;
   
   // Reset state context
   memset(&ctx, 0, sizeof(ctx));
   ctx.rotationDirection = 1;
   
-  // Reset derivative buffer
+  // Reset derivative buffers
   d0BufferReset();
+  peerDistBufferReset();
   
   // Initialize state machine
   currentState = STATE_STRAIGHT;
@@ -1100,6 +1197,11 @@ static void runSequence(void) {
     ctx.d0 = logGetUint(idDistance0);
     d0BufferAdd(ctx.d0, now);
     ctx.d0Deriv = d0BufferGetDerivative();
+    
+    // Update peer distance and derivative (for AVOID state)
+    ctx.peerDist = getPeerDistance();
+    peerDistBufferAdd(ctx.peerDist, now);
+    ctx.peerDistDeriv = peerDistBufferGetDerivative();
 
     // Clear arc cooldown once we re-enter the inner circle
     if (ctx.arcCooldown && ctx.d0 > 0 && ctx.d0 <= innerBoundMm) {
