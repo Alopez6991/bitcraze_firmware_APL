@@ -92,7 +92,7 @@ static uint32_t demoTimeMs = 60000U;         // time of the demo in ms
 #define UTURN_CONFIRM_COUNT 2               // Samples to confirm middle bound exceeded
 #define UTURN_YAW_RATE_DPS 60.0f            // Yaw rate for 180° turn (deg/s)
 #define UTURN_YAW_TOLERANCE 5.0f            // Degrees tolerance for completing turn
-#define UTURN_FLY_MIN_TIME_MS 2000U         // Minimum time in UTURN_FLY before allowing re-entry to UTURN
+#define UTURN_COOLDOWN_MS 2000U             // Cooldown before another UTURN can be triggered
 
 // ============================================================================
 // Log variable IDs
@@ -158,7 +158,6 @@ static uint8_t middleBoundOverCount = 0;    // Confirmation counter for middle b
 static float uturnYawStart = 0.0f;          // Yaw at start of UTURN
 static float uturnTargetYaw = 0.0f;         // Target yaw (180° from start)
 static bool uturnActive = false;            // Whether we're actively tracking the 180° turn
-static uint32_t uturnFlyEntryTime = 0;      // Timestamp when UTURN_FLY was entered
 static uint32_t uturnCooldownEndTime = 0;   // Timestamp when UTURN cooldown ends
 
 // Sequence abort flag set by emergency check
@@ -961,8 +960,8 @@ static void executeDance(void) {
 static void onEnterUturn(void) {
   DEBUG_PRINT("[%.2f] Enter UTURN (drone %u)\n", (double)getTimestamp(), droneId);
   
-  // Set cooldown end time (2 seconds from now)
-  uturnCooldownEndTime = (xTaskGetTickCount() * portTICK_PERIOD_MS) + 2000;
+  // Set cooldown end time
+  uturnCooldownEndTime = (xTaskGetTickCount() * portTICK_PERIOD_MS) + UTURN_COOLDOWN_MS;
   
   // Capture starting yaw and compute target (180° turn)
   uturnYawStart = logGetFloat(idYaw);
@@ -982,11 +981,7 @@ static void onExitUturn(void) {
 }
 
 static FlightState checkTransitionUturn(void) {
-  // UTURN -> AVOID: peer too close (safety override)
-  // if (shouldEnterAvoid()) {
-  //   DEBUG_PRINT("[%.2f] UTURN -> AVOID: peer too close\n", (double)getTimestamp());
-  //   return STATE_AVOID;
-  // }
+
   // UTURN -> DANCE: peer dangerously close (safety override)
   if (shouldEnterDance()) {
     DEBUG_PRINT("[%.2f] Uturn -> DANCE: peer in danger zone (dist=%lu <= %u)\n",
@@ -1033,7 +1028,6 @@ static void executeUturn(void) {
 
 // --- UTURN_FLY state (flying straight back after 180° turn) ---
 static void onEnterUturnFly(void) {
-  uturnFlyEntryTime = xTaskGetTickCount() * portTICK_PERIOD_MS;
   middleBoundOverCount = 0;  // Reset confirmation counter for potential re-entry
   DEBUG_PRINT("[%.2f] Enter UTURN_FLY (drone %u): flying straight, hoping to reach inner bound\n",
               (double)getTimestamp(), droneId);
@@ -1058,19 +1052,11 @@ static FlightState checkTransitionUturnFly(void) {
     return STATE_STRAIGHT;
   }
   
-  // UTURN_FLY -> UTURN: hit middle bound again after minimum time (allow retry)
-  uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
-  if ((now - uturnFlyEntryTime) >= UTURN_FLY_MIN_TIME_MS) {
-    const uint16_t middleBound = getMiddleBoundMm();
-    if (ctx.d0 >= middleBound && ctx.d0 < dist0AbortMm) {
-      if (++middleBoundOverCount >= UTURN_CONFIRM_COUNT) {
-        DEBUG_PRINT("[%.2f] UTURN_FLY -> UTURN: middle bound exceeded again (d0=%lu >= %u)\n",
-                    (double)getTimestamp(), (unsigned long)ctx.d0, middleBound);
-        return STATE_UTURN;
-      }
-    } else {
-      middleBoundOverCount = 0;
-    }
+  // UTURN_FLY -> UTURN: hit middle bound again (cooldown handled by shouldEnterUturn)
+  if (shouldEnterUturn()) {
+    DEBUG_PRINT("[%.2f] UTURN_FLY -> UTURN: middle bound exceeded again (d0=%lu >= %u)\n",
+                (double)getTimestamp(), (unsigned long)ctx.d0, getMiddleBoundMm());
+    return STATE_UTURN;
   }
   
   // If we hit outer bound, emergency land will be triggered by checkAndMaybeEmergencyLand()
@@ -1340,8 +1326,8 @@ void appMain(void) {
         landToZero();
       }
       
-      // On rising edge of trigger, run the sequence
-      if (active && !wasActive) {
+      // On rising edge of trigger, run the sequence only if the middle beacon is on.
+      if ((logGetUint(idDistance0) > 0) && active && !wasActive) {
         // Set velocity controller gains to ensure consistent behavior
         setVelocityControllerGains();
         runSequence();
